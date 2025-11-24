@@ -1,0 +1,225 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            Int            @id @default(autoincrement())
+  email         String?        @unique
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  fullName      String
+  passwordHash  String
+  role          UserRole       @default(SELLER)
+  username      String         @unique
+  phoneNumber   String?
+  auditLogs     AuditLog[]
+  notifications Notification[]
+  transactions  Transaction[]
+
+  @@map("users")
+}
+
+model Category {
+  id          Int      @id @default(autoincrement())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  drugs       Drug[]
+
+  @@map("categories")
+}
+
+model Supplier {
+  id             Int             @id @default(autoincrement())
+  name           String
+  contactName    String?
+  phone          String
+  email          String?
+  address        String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  batches        Batch[]
+  purchaseOrders PurchaseOrder[]
+
+  @@unique([name, phone], name: "uniq_supplier_name_phone")
+  @@map("suppliers")
+}
+
+model Drug {
+  id                 Int                 @id @default(autoincrement())
+  sku                String              @unique
+  genericName        String
+  tradeName          String?
+  strength           String
+  description        String
+  categoryId         Int
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  batches            Batch[]
+  category           Category            @relation(fields: [categoryId], references: [id])
+  purchaseOrderItems PurchaseOrderItem[]
+
+  @@map("drugs")
+}
+
+model Batch {
+  id                 Int                 @id @default(autoincrement())
+  drugId             Int
+  supplierId         Int
+  manufactureDate    DateTime
+  expiryDate         DateTime
+  unitCost           Float
+  purchaseDate       DateTime
+  currentQty         Int                 @default(0)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  unitPrice          Float
+  lowStockThreshold  Int                 @default(10)
+  drug               Drug                @relation(fields: [drugId], references: [id])
+  supplier           Supplier            @relation(fields: [supplierId], references: [id])
+  locationBatches    LocationBatch[]
+  purchaseOrderItems PurchaseOrderItem[]
+  transactions       Transaction[]
+
+  @@map("batches")
+}
+
+model Location {
+  id               Int             @id @default(autoincrement())
+  name             String          @unique
+  description      String?
+  maxCapacity      String?
+  currentQty       Int             @default(0)
+  locationType     String
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  locationBatches  LocationBatch[]
+  transactionsFrom Transaction[]   @relation("TransactionFrom")
+  transactionsTo   Transaction[]   @relation("TransactionTo")
+
+  @@map("locations")
+}
+
+model LocationBatch {
+  id         Int      @id @default(autoincrement())
+  locationId Int
+  batchId    Int
+  quantity   Int      @default(0)
+  batch      Batch    @relation(fields: [batchId], references: [id])
+  location   Location @relation(fields: [locationId], references: [id])
+
+  @@unique([locationId, batchId])
+  @@map("location_batches")
+}
+
+model PurchaseOrder {
+  id           Int                 @id @default(autoincrement())
+  supplierId   Int
+  createdDate  DateTime            @default(now())
+  expectedDate DateTime?
+  status       String
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  items        PurchaseOrderItem[]
+  supplier     Supplier            @relation(fields: [supplierId], references: [id])
+
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderItem {
+  id               Int           @id @default(autoincrement())
+  purchaseOrderId  Int
+  drugId           Int
+  batchId          Int?
+  quantityOrdered  Int
+  quantityReceived Int           @default(0)
+  unitCost         Float
+  status           String
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  expiryDate       DateTime?
+  manufactureDate  DateTime?
+  batch            Batch?        @relation(fields: [batchId], references: [id])
+  drug             Drug          @relation(fields: [drugId], references: [id])
+  purchaseOrder    PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  @@map("purchase_order_items")
+}
+
+model Transaction {
+  id              Int       @id @default(autoincrement())
+  batchId         Int
+  transactionType String
+  quantity        Int
+  transactionDate DateTime  @default(now())
+  userId          Int?
+  notes           String?
+  fromLocationId  Int?
+  toLocationId    Int?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  status          String?
+  batch           Batch     @relation(fields: [batchId], references: [id])
+  fromLocation    Location? @relation("TransactionFrom", fields: [fromLocationId], references: [id])
+  toLocation      Location? @relation("TransactionTo", fields: [toLocationId], references: [id])
+  user            User?     @relation(fields: [userId], references: [id])
+
+  @@map("transactions")
+}
+
+model AuditLog {
+  id            Int      @id @default(autoincrement())
+  entityName    String
+  entityId      Int
+  action        String
+  userId        Int?
+  timestamp     DateTime @default(now())
+  changeSummary String?
+  user          User?    @relation(fields: [userId], references: [id])
+
+  @@map("audit_logs")
+}
+
+model Notification {
+  id               Int       @id @default(autoincrement())
+  userId           Int?
+  notificationType String
+  message          String
+  severity         String
+  isRead           Boolean   @default(false)
+  readAt           DateTime?
+  expiresAt        DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  user             User?     @relation(fields: [userId], references: [id])
+
+  @@index([notificationType, createdAt], map: "idx_notifications_type_created")
+  @@index([severity, createdAt], map: "idx_notifications_severity_created")
+  @@map("notifications")
+}
+
+model GeneralConfig {
+  id          Int      @id @default(autoincrement())
+  key         String   @unique
+  value       String
+  dataType    String
+  category    String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("general_configs")
+}
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  PHARMACIST
+  SELLER
+}

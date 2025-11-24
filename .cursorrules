@@ -1,0 +1,162 @@
+# PIMS Backend - Cursor Rules
+
+## Project Overview
+
+This is a **Personal Information Management System (PIMS)** backend built with NestJS, Prisma, and PostgreSQL. It's a **pharmacy inventory management system** that tracks drugs, batches, suppliers, locations, and transactions.
+
+## Core Architecture Principles
+
+#1 try to not make errors
+
+### 2. Technology Stack
+
+- **Framework**: NestJS (TypeScript)
+- **Database**: PostgreSQL with Prisma ORM
+- **Documentation**: Swagger/OpenAPI
+- **Validation**: class-validator + class-transformer
+- **Architecture**: Modular, dependency injection
+- **Application**: Completely offline, no external API dependencies
+
+### 3. Database Schema (14 Core Tables)
+
+**Core Tables**: users, roles (enum), categories
+**Product Management**: drugs, batches, suppliers
+**Location & Inventory**: locations, location_batches
+**Order Management**: purchase_orders, purchase_order_items
+**Transaction & Audit**: transactions, audit_logs
+**Notifications & Config**: notifications, general_configs
+
+## Development Guidelines
+
+### 4. Module Structure
+
+### 5. Implementation Priority
+
+**Phase 1**: Roles & Authentication → Categories → Suppliers
+**Phase 2**: Drugs → Batches → Locations
+**Phase 3**: Inventory → Purchase Orders → Transactions
+**Phase 4**: Notifications → Audit → Config
+
+### 6. Code Standards
+
+#### Controllers
+
+- **ALWAYS** use Swagger decorators: `@ApiTags()`, `@ApiOperation()`, `@ApiResponse()`
+- **ALWAYS** use proper HTTP status codes
+- **ALWAYS** implement proper error handling
+- **ALWAYS** validate input with DTOs
+
+#### Services
+
+- **ALWAYS** use `@Injectable()` decorator
+- **ALWAYS** handle Prisma errors and convert to HTTP exceptions
+- **ALWAYS** implement proper business logic validation
+- **ALWAYS** use dependency injection for PrismaService
+
+#### DTOs
+
+- **ALWAYS** use `@ApiProperty()` for Swagger documentation
+- **ALWAYS** use class-validator decorators for validation
+- **ALWAYS** provide examples and descriptions
+- **ALWAYS** use `PartialType()` for update DTOs
+
+#### Database
+
+- **ALWAYS** use Prisma for all database operations
+- **ALWAYS** handle foreign key constraints and unique violations
+- **ALWAYS** implement proper error handling for database operations
+- **ALWAYS** use transactions for complex operations
+
+### 7. Error Handling Standards
+
+- **ALWAYS** use NestJS built-in exceptions: `NotFoundException`, `ConflictException`, `BadRequestException`
+- **ALWAYS** create custom exceptions for business logic errors
+- **ALWAYS** provide meaningful error messages
+- **ALWAYS** log errors appropriately
+
+### 8. Validation Requirements
+
+- **ALWAYS** validate all input data
+- **ALWAYS** use class-validator decorators
+- **ALWAYS** implement custom validation pipes when needed
+- **ALWAYS** validate business rules in services
+
+### 9. Security Considerations
+
+- **ALWAYS** implement role-based access control
+- **ALWAYS** validate user permissions
+- **ALWAYS** sanitize input data
+- **ALWAYS** implement audit logging for sensitive operations
+
+### 11. Documentation Requirements
+
+- **ALWAYS** document API endpoints with Swagger
+- **ALWAYS** provide examples in DTOs
+
+### 12. Database Operations
+
+- **ALWAYS** use Prisma transactions for multi-table operations
+- **ALWAYS** handle Prisma error codes (P2002, P2025, etc.)
+- **ALWAYS** implement proper cascade deletes
+- **ALWAYS** use proper indexing for performance
+
+### 13. Business Logic Rules
+
+- **ALWAYS** validate stock availability before transactions
+- **ALWAYS** check expiry dates for drug batches
+- **ALWAYS** implement proper inventory tracking
+- **ALWAYS** maintain audit trails for all operations
+
+### 14. File Naming Conventions
+
+- Controllers: `*.controller.ts`
+- Services: `*.service.ts`
+- Modules: `*.module.ts`
+- DTOs: `*.dto.ts`
+- Tests: `*.spec.ts`
+
+### 15. Import Organization
+
+- **ALWAYS** group imports: NestJS → Third-party → Local
+- **ALWAYS** use absolute imports for local modules
+- **ALWAYS** sort imports alphabetically within groups
+
+### 16. Environment Configuration
+
+- **ALWAYS** use environment variables for configuration
+- **ALWAYS** provide default values where appropriate
+- **ALWAYS** validate environment variables on startup
+
+### 17. Performance Considerations
+
+- **ALWAYS** use database indexes for frequently queried fields
+- **ALWAYS** implement pagination for list endpoints
+- **ALWAYS** use proper database queries (avoid N+1 problems)
+
+### 18. Offline-First Design
+
+- **ALWAYS** ensure the application works completely offline
+- **ALWAYS** avoid external API dependencies
+- **ALWAYS** use local database for all data storage
+- **ALWAYS** implement local file-based configuration
+
+### 19. User Experience
+
+- **ALWAYS** provide clear error messages
+- **ALWAYS** implement proper loading states
+- **ALWAYS** provide helpful API documentation
+- **ALWAYS** ensure consistent response formats
+
+### 20. Maintenance
+
+- **ALWAYS** keep dependencies updated
+- **ALWAYS** follow semantic versioning
+- **ALWAYS** maintain proper code comments
+- **ALWAYS** implement proper logging
+
+## Key Reminders
+
+- This is a **pharmacy inventory management system**
+- Follow **backend-first development approach**
+- Use **simple yet robust architecture**
+- Ask on when confused
