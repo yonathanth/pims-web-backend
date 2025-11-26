@@ -302,7 +302,7 @@ export class NotificationsService implements OnModuleInit {
       await this.createIfNotExists({
         notificationType: NotificationType.OUT_OF_STOCK,
         severity: NotificationSeverity.HIGH,
-        message: `Batch #${batch.id} (${batch.drug.tradeName ?? batch.drug.genericName}) is out of stock`,
+        message: `Batch ${batch.batchNumber ? `#${batch.batchNumber}` : `#${batch.id}`} (${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) is out of stock`,
         entityName: 'Batch',
         entityId: batch.id,
       });
@@ -311,7 +311,7 @@ export class NotificationsService implements OnModuleInit {
       await this.createIfNotExists({
         notificationType: NotificationType.LOW_STOCK,
         severity: NotificationSeverity.MEDIUM,
-        message: `Batch #${batch.id} (${batch.drug.tradeName ?? batch.drug.genericName}) is running low on stock (${batch.currentQty} remaining)`,
+        message: `Batch ${batch.batchNumber ? `#${batch.batchNumber}` : `#${batch.id}`} (${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) is running low on stock (${batch.currentQty} remaining)`,
         entityName: 'Batch',
         entityId: batch.id,
       });
@@ -389,7 +389,7 @@ export class NotificationsService implements OnModuleInit {
         await this.createIfNotExists({
           notificationType: NotificationType.NEAR_EXPIRY,
           severity,
-          message: `Batch #${batch.id} (${batch.drug.tradeName ?? batch.drug.genericName}) expires in ${days} day${days > 1 ? 's' : ''}`,
+          message: `Batch ${batch.batchNumber ? `#${batch.batchNumber}` : `#${batch.id}`} (${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) expires in ${days} day${days > 1 ? 's' : ''}`,
           entityName: 'Batch',
           entityId: batch.id,
           expiresAt: batch.expiryDate.toISOString(),
@@ -427,10 +427,11 @@ export class NotificationsService implements OnModuleInit {
               ? NotificationSeverity.MEDIUM
               : NotificationSeverity.LOW;
 
+        const batchIdentifier = batch.batchNumber ? `#${batch.batchNumber}` : `#${batch.id}`;
         const message =
           days === 0
-            ? `Batch #${batch.id} (${batch.drug.tradeName ?? batch.drug.genericName}) has expired today`
-            : `Batch #${batch.id} (${batch.drug.tradeName ?? batch.drug.genericName}) expired ${days} day${days > 1 ? 's' : ''} ago`;
+            ? `Batch ${batchIdentifier} (${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) has expired today`
+            : `Batch ${batchIdentifier} (${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) expired ${days} day${days > 1 ? 's' : ''} ago`;
 
         await this.createIfNotExists({
           notificationType: NotificationType.EXPIRED,

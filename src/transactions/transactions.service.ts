@@ -178,8 +178,9 @@ export class TransactionsService {
     const data = rawData.map((transaction) => ({
       ...transaction,
       drugSku: transaction.batch.drug.sku,
-      drugName:
-        transaction.batch.drug.tradeName ?? transaction.batch.drug.genericName,
+      drugName: transaction.batch.drug.tradeName
+        ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
+        : transaction.batch.drug.genericName,
       supplierName: transaction.batch.supplier.name,
       username: transaction.user?.username || 'Unknown User',
       fromLocationName: transaction.fromLocation?.name,
@@ -247,8 +248,9 @@ export class TransactionsService {
     return {
       ...transaction,
       drugSku: transaction.batch.drug.sku,
-      drugName:
-        transaction.batch.drug.tradeName ?? transaction.batch.drug.genericName,
+      drugName: transaction.batch.drug.tradeName
+        ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
+        : transaction.batch.drug.genericName,
       supplierName: transaction.batch.supplier.name,
       username: transaction.user?.username || 'Unknown User',
       fromLocationName: transaction.fromLocation?.name,
@@ -303,8 +305,9 @@ export class TransactionsService {
       toLocationId: transaction.toLocationId || undefined,
       userId: transaction.userId || undefined,
       drugSku: transaction.batch.drug.sku,
-      drugName:
-        transaction.batch.drug.tradeName ?? transaction.batch.drug.genericName,
+      drugName: transaction.batch.drug.tradeName
+        ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
+        : transaction.batch.drug.genericName,
       supplierName: transaction.batch.supplier.name,
       username: transaction.user?.fullName || 'Unknown User',
       fromLocationName: transaction.fromLocation?.name,

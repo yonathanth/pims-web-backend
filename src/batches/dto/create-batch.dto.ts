@@ -6,11 +6,21 @@ import {
   IsNumber,
   IsOptional,
   IsArray,
+  IsString,
   Min,
 } from 'class-validator';
 import { Transform } from 'class-transformer';
 
 export class CreateBatchDto {
+  @ApiProperty({
+    description: 'Batch number (optional, user-entered)',
+    example: 'BATCH-001',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  batchNumber?: string;
+
   @ApiProperty({ description: 'Drug ID' })
   @IsInt()
   @Min(1)

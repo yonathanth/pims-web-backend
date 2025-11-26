@@ -37,9 +37,9 @@ export class SalesService {
 
       return pendingSales.map((transaction) => ({
         id: transaction.id,
-        drugName:
-          transaction.batch.drug.tradeName ??
-          transaction.batch.drug.genericName,
+        drugName: transaction.batch.drug.tradeName
+          ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
+          : transaction.batch.drug.genericName,
         sku: transaction.batch.drug.sku,
         category: transaction.batch.drug.category.name,
         quantity: transaction.quantity,
@@ -53,7 +53,9 @@ export class SalesService {
         createdAt: transaction.createdAt,
         notes: transaction.notes,
         batchId: transaction.batchId,
-        batchNumber: `B${transaction.batch.id.toString().padStart(6, '0')}`,
+        batchNumber:
+          transaction.batch.batchNumber ??
+          `B${transaction.batch.id.toString().padStart(6, '0')}`,
         expiryDate: transaction.batch.expiryDate,
         currentStock: transaction.batch.currentQty,
       }));
@@ -134,9 +136,9 @@ export class SalesService {
 
       const sales = transactions.map((transaction) => ({
         id: transaction.id,
-        drugName:
-          transaction.batch.drug.tradeName ??
-          transaction.batch.drug.genericName,
+        drugName: transaction.batch.drug.tradeName
+          ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
+          : transaction.batch.drug.genericName,
         sku: transaction.batch.drug.sku,
         category: transaction.batch.drug.category.name,
         quantity: transaction.quantity,
@@ -152,7 +154,9 @@ export class SalesService {
         updatedAt: transaction.updatedAt,
         notes: transaction.notes,
         batchId: transaction.batchId,
-        batchNumber: `B${transaction.batch.id.toString().padStart(6, '0')}`,
+        batchNumber:
+          transaction.batch.batchNumber ??
+          `B${transaction.batch.id.toString().padStart(6, '0')}`,
         expiryDate: transaction.batch.expiryDate,
       }));
 

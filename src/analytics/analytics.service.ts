@@ -374,8 +374,9 @@ export class AnalyticsService {
           include: { drug: true },
         });
         return {
-          drugName:
-            batch?.drug?.tradeName || batch?.drug?.genericName || 'Unknown',
+          drugName: batch?.drug?.tradeName
+            ? `${batch.drug.genericName} (${batch.drug.tradeName})`
+            : batch?.drug?.genericName || 'Unknown',
           soldQty: r._sum.quantity || 0,
         };
       }),
@@ -406,7 +407,7 @@ export class AnalyticsService {
       genericName: item.drug.tradeName ?? item.drug.genericName,
       tradeName: item.drug.tradeName || undefined,
       sku: item.drug.sku || undefined,
-      batchNumber: item.batch?.id.toString() || undefined,
+      batchNumber: item.batch?.batchNumber ?? (item.batch?.id.toString() || undefined),
       expiryDate:
         item.batch?.expiryDate?.toISOString().split('T')[0] || undefined,
       quantity: item.quantityReceived,
@@ -674,7 +675,7 @@ export class AnalyticsService {
         genericName: d.tradeName ?? d.genericName,
         tradeName: d.tradeName || undefined,
         sku: d.sku || undefined,
-        batchNumber: firstBatch?.id ? firstBatch.id.toString() : undefined,
+        batchNumber: firstBatch?.batchNumber ?? (firstBatch?.id ? firstBatch.id.toString() : undefined),
         expiryDate: firstBatch?.expiryDate
           ? firstBatch.expiryDate.toISOString().split('T')[0]
           : undefined,
@@ -704,7 +705,7 @@ export class AnalyticsService {
       genericName: b.drug.tradeName ?? b.drug.genericName,
       tradeName: b.drug.tradeName || undefined,
       sku: b.drug.sku || undefined,
-      batchNumber: b.id.toString(),
+      batchNumber: b.batchNumber ?? b.id.toString(),
       expiryDate: b.expiryDate?.toISOString().split('T')[0] || undefined,
       quantity: b.locationBatches.reduce((sum, lb) => sum + lb.quantity, 0),
       location: undefined,
@@ -734,7 +735,7 @@ export class AnalyticsService {
       genericName: b.drug.tradeName ?? b.drug.genericName,
       tradeName: b.drug.tradeName || undefined,
       sku: b.drug.sku || undefined,
-      batchNumber: b.id.toString(),
+      batchNumber: b.batchNumber ?? b.id.toString(),
       expiryDate: b.expiryDate?.toISOString().split('T')[0] || undefined,
       quantity: b.locationBatches.reduce((sum, lb) => sum + lb.quantity, 0),
       location: undefined,
@@ -777,7 +778,7 @@ export class AnalyticsService {
         genericName: d.tradeName ?? d.genericName,
         tradeName: d.tradeName || undefined,
         sku: d.sku || undefined,
-        batchNumber: hasBatch ? d.batches[0].id.toString() : undefined,
+        batchNumber: hasBatch ? (d.batches[0].batchNumber ?? d.batches[0].id.toString()) : undefined,
         expiryDate:
           hasBatch && d.batches[0].expiryDate
             ? d.batches[0].expiryDate.toISOString().split('T')[0]
@@ -827,7 +828,7 @@ export class AnalyticsService {
           genericName: batch.drug.tradeName ?? batch.drug.genericName,
           tradeName: batch.drug.tradeName || undefined,
           sku: batch.drug.sku || undefined,
-          batchNumber: batch.id.toString(),
+          batchNumber: batch.batchNumber ?? batch.id.toString(),
           expiryDate:
             batch.expiryDate?.toISOString().split('T')[0] || undefined,
           quantity: currentQty,

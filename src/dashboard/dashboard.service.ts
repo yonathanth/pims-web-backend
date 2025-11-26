@@ -187,8 +187,17 @@ export class DashboardService {
 
       return topDrugs.map((td) => {
         const batch = batches.find((b) => b.id === td.batchId);
+        if (!batch?.drug) {
+          return {
+            name: 'Unknown Drug',
+            quantity: td._sum.quantity || 0,
+          };
+        }
+        const drugName = batch.drug.tradeName
+          ? `${batch.drug.genericName} (${batch.drug.tradeName})`
+          : batch.drug.genericName;
         return {
-          name: (batch?.drug.tradeName ?? batch?.drug.genericName) || 'Unknown Drug',
+          name: drugName || 'Unknown Drug',
           quantity: td._sum.quantity || 0,
         };
       });

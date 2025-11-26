@@ -22,7 +22,7 @@ export class ListBatchesDto {
   limit?: number = 50;
 
   @ApiPropertyOptional({
-    description: 'Search across drug name/sku or supplier name',
+    description: 'Search across drug name/sku, supplier name, or batch number',
     example: 'amox',
   })
   @IsOptional()
@@ -58,18 +58,35 @@ export class ListBatchesDto {
   expiryTo?: string;
 
   @ApiPropertyOptional({
-    enum: ['purchaseDate', 'expiryDate', 'currentQty', 'drugName', 'sku', 'id'],
+    enum: [
+      'purchaseDate',
+      'expiryDate',
+      'currentQty',
+      'drugName',
+      'sku',
+      'id',
+      'batchNumber',
+    ],
     description: 'Sort by field',
   })
   @IsOptional()
-  @IsIn(['purchaseDate', 'expiryDate', 'currentQty', 'drugName', 'sku', 'id'])
+  @IsIn([
+    'purchaseDate',
+    'expiryDate',
+    'currentQty',
+    'drugName',
+    'sku',
+    'id',
+    'batchNumber',
+  ])
   sortBy?:
     | 'purchaseDate'
     | 'expiryDate'
     | 'currentQty'
     | 'drugName'
     | 'sku'
-    | 'id' = 'id';
+    | 'id'
+    | 'batchNumber' = 'id';
 
   @ApiPropertyOptional({
     enum: [

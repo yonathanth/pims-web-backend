@@ -22,6 +22,14 @@ export class BatchesService {
     private auditLogService: AuditLogService,
   ) {}
 
+  // Helper function to format drug name as "genericName (tradeName)" or just "genericName"
+  private formatDrugName(genericName: string, tradeName?: string | null): string {
+    if (tradeName && tradeName.trim()) {
+      return `${genericName} (${tradeName})`;
+    }
+    return genericName;
+  }
+
   @Audit({
     entityName: 'Batch',
     action: 'CREATE',
@@ -53,6 +61,24 @@ export class BatchesService {
       );
     }
 
+    // Normalize batchNumber: convert empty string to null/undefined
+    const normalizedBatchNumber =
+      data.batchNumber && data.batchNumber.trim()
+        ? data.batchNumber.trim()
+        : undefined;
+
+    // If batchNumber is provided, check for uniqueness
+    if (normalizedBatchNumber) {
+      const existing = await this.prisma.batch.findUnique({
+        where: { batchNumber: normalizedBatchNumber },
+      });
+      if (existing) {
+        throw new ConflictException(
+          `Batch number "${normalizedBatchNumber}" already exists`,
+        );
+      }
+    }
+
     // If locations are provided, validate them and create mapping rows
     if (data.locationIds && data.locationIds.length > 0) {
       // Ensure all provided locations exist
@@ -70,9 +96,55 @@ export class BatchesService {
       }
 
       // Create batch and mappings in a transaction
-      const result = await this.prisma.$transaction(async (tx) => {
-        const created = await tx.batch.create({
+      try {
+        const result = await this.prisma.$transaction(async (tx) => {
+          const created = await tx.batch.create({
+            data: {
+              batchNumber: normalizedBatchNumber,
+              drugId: data.drugId,
+              supplierId: data.supplierId,
+              manufactureDate: new Date(data.manufactureDate),
+              expiryDate: new Date(data.expiryDate),
+              unitPrice: data.unitPrice,
+              unitCost: data.unitCost,
+              purchaseDate: new Date(data.purchaseDate),
+              currentQty: data.currentQty ?? 0,
+              lowStockThreshold: data.lowStockThreshold ?? 10,
+            },
+          });
+
+          if (uniqueLocationIds.length > 0) {
+            await tx.locationBatch.createMany({
+              data: uniqueLocationIds.map((locationId) => ({
+                locationId,
+                batchId: created.id,
+                quantity: Math.floor(
+                  (data.currentQty ?? 0) / uniqueLocationIds.length,
+                ),
+              })),
+            });
+          }
+
+          return created;
+        });
+
+        return result;
+      } catch (error: any) {
+        if (error.code === 'P2002' && error.meta?.target?.includes('batchNumber')) {
+          throw new ConflictException(
+            normalizedBatchNumber
+              ? `Batch number "${normalizedBatchNumber}" already exists`
+              : 'A batch with an empty batch number already exists',
+          );
+        }
+        throw error;
+      }
+    } else {
+      // Create batch without location mappings
+      try {
+        return await this.prisma.batch.create({
           data: {
+            batchNumber: normalizedBatchNumber,
             drugId: data.drugId,
             supplierId: data.supplierId,
             manufactureDate: new Date(data.manufactureDate),
@@ -84,38 +156,16 @@ export class BatchesService {
             lowStockThreshold: data.lowStockThreshold ?? 10,
           },
         });
-
-        if (uniqueLocationIds.length > 0) {
-          await tx.locationBatch.createMany({
-            data: uniqueLocationIds.map((locationId) => ({
-              locationId,
-              batchId: created.id,
-              quantity: Math.floor(
-                (data.currentQty ?? 0) / uniqueLocationIds.length,
-              ),
-            })),
-          });
+      } catch (error: any) {
+        if (error.code === 'P2002' && error.meta?.target?.includes('batchNumber')) {
+          throw new ConflictException(
+            normalizedBatchNumber
+              ? `Batch number "${normalizedBatchNumber}" already exists`
+              : 'A batch with an empty batch number already exists',
+          );
         }
-
-        return created;
-      });
-
-      return result;
-    } else {
-      // Create batch without location mappings
-      return this.prisma.batch.create({
-        data: {
-          drugId: data.drugId,
-          supplierId: data.supplierId,
-          manufactureDate: new Date(data.manufactureDate),
-          expiryDate: new Date(data.expiryDate),
-          unitPrice: data.unitPrice,
-          unitCost: data.unitCost,
-          purchaseDate: new Date(data.purchaseDate),
-          currentQty: data.currentQty ?? 0,
-          lowStockThreshold: data.lowStockThreshold ?? 10,
-        },
-      });
+        throw error;
+      }
     }
   }
 
@@ -176,7 +226,7 @@ export class BatchesService {
       }
     }
 
-    // Search via relations (drug.sku/name or supplier.name)
+    // Search via relations (drug.sku/name or supplier.name) or batchNumber
     if (query?.search) {
       where.OR = [
         {
@@ -196,6 +246,9 @@ export class BatchesService {
           supplier: {
             name: { contains: query.search, mode: 'insensitive' },
           } as any,
+        },
+        {
+          batchNumber: { contains: query.search, mode: 'insensitive' },
         },
       ];
     }
@@ -238,7 +291,10 @@ export class BatchesService {
     let data = rawData.map((batch) => ({
       ...batch,
       drugSku: batch.drug.sku,
-      drugName: batch.drug.tradeName ?? batch.drug.genericName,
+      drugName: this.formatDrugName(
+        batch.drug.genericName,
+        batch.drug.tradeName,
+      ),
       supplierName: batch.supplier.name,
       drug: undefined, // Remove the drug object
       supplier: undefined, // Remove the supplier object
@@ -279,6 +335,7 @@ export class BatchesService {
           select: {
             sku: true,
             genericName: true,
+            tradeName: true,
           },
         },
         supplier: {
@@ -293,7 +350,10 @@ export class BatchesService {
     return {
       ...batch,
       drugSku: batch.drug.sku,
-      drugName: batch.drug.genericName,
+      drugName: this.formatDrugName(
+        batch.drug.genericName,
+        batch.drug.tradeName,
+      ),
       supplierName: batch.supplier.name,
       drug: undefined, // Remove the drug object
       supplier: undefined, // Remove the supplier object
@@ -335,6 +395,27 @@ export class BatchesService {
 
       // Extract locationIds before updating batch (not a Batch model field)
       const { locationIds, ...batchData } = data;
+
+      // Normalize batchNumber: convert empty string to null/undefined
+      if (batchData.batchNumber !== undefined) {
+        const normalizedBatchNumber =
+          batchData.batchNumber && batchData.batchNumber.trim()
+            ? batchData.batchNumber.trim()
+            : undefined;
+
+        // If batchNumber is provided and different from current, check for uniqueness
+        if (normalizedBatchNumber) {
+          const existing = await this.prisma.batch.findUnique({
+            where: { batchNumber: normalizedBatchNumber },
+          });
+          if (existing && existing.id !== id) {
+            throw new ConflictException(
+              `Batch number "${normalizedBatchNumber}" already exists`,
+            );
+          }
+        }
+        batchData.batchNumber = normalizedBatchNumber;
+      }
 
       // Handle location updates if provided
       if (locationIds !== undefined) {
@@ -411,9 +492,17 @@ export class BatchesService {
           },
         });
       }
-    } catch (error) {
+    } catch (error: any) {
       if (error.code === 'P2025')
         throw new NotFoundException(`Batch with ID ${id} not found`);
+      if (error.code === 'P2002' && error.meta?.target?.includes('batchNumber')) {
+        const batchNumber = data?.batchNumber;
+        throw new ConflictException(
+          batchNumber
+            ? `Batch number "${batchNumber}" already exists. Please use a unique batch number.`
+            : 'A batch with an empty batch number already exists. Please use a unique batch number.',
+        );
+      }
       throw error;
     }
   }

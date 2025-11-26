@@ -70,6 +70,7 @@ model Drug {
 
 model Batch {
   id                 Int                 @id @default(autoincrement())
+  batchNumber        String?             @unique
   drugId             Int
   supplierId         Int
   manufactureDate    DateTime

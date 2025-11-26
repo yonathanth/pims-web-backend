@@ -54,9 +54,12 @@ export class ReportGenerationService {
 
       const reportData = data.map((batch) => ({
         id: batch.id,
-        drugName: batch.drug.tradeName ?? batch.drug.genericName,
+        drugName: batch.drug.tradeName
+          ? `${batch.drug.genericName} (${batch.drug.tradeName})`
+          : batch.drug.genericName,
         sku: batch.drug.sku,
-        batchNumber: `B${batch.id.toString().padStart(6, '0')}`,
+        batchNumber:
+          batch.batchNumber ?? `B${batch.id.toString().padStart(6, '0')}`,
         expiryDate: batch.expiryDate.toISOString().split('T')[0],
         quantity: batch.currentQty,
         location:
@@ -155,7 +158,8 @@ export class ReportGenerationService {
         id: batch.id,
         drugName: batch.drug.tradeName ?? batch.drug.genericName,
         sku: batch.drug.sku,
-        batchNumber: `B${batch.id.toString().padStart(6, '0')}`,
+        batchNumber:
+          batch.batchNumber ?? `B${batch.id.toString().padStart(6, '0')}`,
         expiryDate: batch.expiryDate.toISOString().split('T')[0],
         quantity: batch.currentQty,
         location:
@@ -247,9 +251,9 @@ export class ReportGenerationService {
           .toISOString()
           .split('T')[0],
         sku: transaction.batch.drug.sku,
-        drugName:
-          transaction.batch.drug.tradeName ??
-          transaction.batch.drug.genericName,
+        drugName: transaction.batch.drug.tradeName
+          ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
+          : transaction.batch.drug.genericName,
         quantitySold: transaction.quantity,
         unitPrice: transaction.batch.unitPrice,
         totalPrice: transaction.quantity * transaction.batch.unitPrice,
@@ -326,8 +330,9 @@ export class ReportGenerationService {
       id: transaction.id,
       transactionDate: transaction.transactionDate.toISOString().split('T')[0],
       sku: transaction.batch.drug.sku,
-      drugName:
-        transaction.batch.drug.tradeName ?? transaction.batch.drug.genericName,
+      drugName: transaction.batch.drug.tradeName
+        ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
+        : transaction.batch.drug.genericName,
       quantitySold: transaction.quantity,
       unitPrice: transaction.batch.unitPrice,
       totalPrice: transaction.quantity * transaction.batch.unitPrice,
@@ -400,8 +405,11 @@ export class ReportGenerationService {
         return {
           id: batch.id,
           sku: batch.drug.sku,
-          drugName: batch.drug.genericName,
-          batchNumber: `B${batch.id.toString().padStart(6, '0')}`,
+          drugName: batch.drug.tradeName
+            ? `${batch.drug.genericName} (${batch.drug.tradeName})`
+            : batch.drug.genericName,
+          batchNumber:
+          batch.batchNumber ?? `B${batch.id.toString().padStart(6, '0')}`,
           expiryDate: batch.expiryDate.toISOString().split('T')[0],
           quantityRemaining: batch.currentQty,
           daysUntilExpiry,
@@ -490,8 +498,11 @@ export class ReportGenerationService {
       return {
         id: batch.id,
         sku: batch.drug.sku,
-        drugName: batch.drug.tradeName ?? batch.drug.genericName,
-        batchNumber: `B${batch.id.toString().padStart(6, '0')}`,
+        drugName: batch.drug.tradeName
+          ? `${batch.drug.genericName} (${batch.drug.tradeName})`
+          : batch.drug.genericName,
+        batchNumber:
+          batch.batchNumber ?? `B${batch.id.toString().padStart(6, '0')}`,
         expiryDate: batch.expiryDate.toISOString().split('T')[0],
         quantityRemaining: batch.currentQty,
         daysUntilExpiry,
@@ -587,7 +598,9 @@ export class ReportGenerationService {
             item.purchaseOrder.expectedDate?.toISOString().split('T')[0] ||
             'N/A',
           supplier: item.purchaseOrder.supplier.name,
-          drugName: item.drug.genericName,
+          drugName: item.drug.tradeName
+            ? `${item.drug.genericName} (${item.drug.tradeName})`
+            : item.drug.genericName,
           sku: item.drug.sku,
           category: item.drug.category.name,
           quantityOrdered: item.quantityOrdered,
