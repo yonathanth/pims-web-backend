@@ -35,6 +35,19 @@ model Category {
   @@map("categories")
 }
 
+model UnitType {
+  id          Int      @id @default(autoincrement())
+  name        String   @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  batches     Batch[]
+  purchaseOrderItems PurchaseOrderItem[]
+
+  @@map("unit_types")
+}
+
 model Supplier {
   id             Int             @id @default(autoincrement())
   name           String
@@ -73,6 +86,7 @@ model Batch {
   batchNumber        String?             @unique
   drugId             Int
   supplierId         Int
+  unitTypeId         Int
   manufactureDate    DateTime
   expiryDate         DateTime
   unitCost           Float
@@ -84,6 +98,7 @@ model Batch {
   lowStockThreshold  Int                 @default(10)
   drug               Drug                @relation(fields: [drugId], references: [id])
   supplier           Supplier            @relation(fields: [supplierId], references: [id])
+  unitType           UnitType            @relation(fields: [unitTypeId], references: [id])
   locationBatches    LocationBatch[]
   purchaseOrderItems PurchaseOrderItem[]
   transactions       Transaction[]
@@ -138,6 +153,7 @@ model PurchaseOrderItem {
   purchaseOrderId  Int
   drugId           Int
   batchId          Int?
+  unitTypeId       Int
   quantityOrdered  Int
   quantityReceived Int           @default(0)
   unitCost         Float
@@ -148,6 +164,7 @@ model PurchaseOrderItem {
   manufactureDate  DateTime?
   batch            Batch?        @relation(fields: [batchId], references: [id])
   drug             Drug          @relation(fields: [drugId], references: [id])
+  unitType         UnitType      @relation(fields: [unitTypeId], references: [id])
   purchaseOrder    PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
 
   @@map("purchase_order_items")

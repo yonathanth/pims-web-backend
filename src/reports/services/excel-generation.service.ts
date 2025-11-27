@@ -35,9 +35,21 @@ export class ExcelGenerationService {
     worksheet: ExcelJS.Worksheet,
     reportData: ReportData,
   ) {
-    // Title
+    // Pharmacy name
     worksheet.mergeCells('A1:H1');
-    const titleCell = worksheet.getCell('A1');
+    const pharmacyCell = worksheet.getCell('A1');
+    pharmacyCell.value = 'Liyuwork Pharmacy - Central Ethiopia, Hadiya, Hossana,';
+    pharmacyCell.font = { bold: true, size: 14 };
+    pharmacyCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    pharmacyCell.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFD0D0D0' },
+    };
+
+    // Title
+    worksheet.mergeCells('A2:H2');
+    const titleCell = worksheet.getCell('A2');
     titleCell.value = reportData.reportType;
     titleCell.font = { bold: true, size: 16 };
     titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
@@ -48,18 +60,18 @@ export class ExcelGenerationService {
     };
 
     // Generation info
-    worksheet.getCell('A2').value = 'Generated:';
-    worksheet.getCell('B2').value = new Date().toLocaleString();
-    worksheet.getCell('A2').font = { bold: true };
+    worksheet.getCell('A3').value = 'Generated:';
+    worksheet.getCell('B3').value = new Date().toLocaleString();
+    worksheet.getCell('A3').font = { bold: true };
 
     // Empty row
-    worksheet.getRow(3).height = 10;
+    worksheet.getRow(4).height = 10;
 
     // Filters section
-    worksheet.getCell('A4').value = 'Filters Applied:';
-    worksheet.getCell('A4').font = { bold: true, underline: true };
+    worksheet.getCell('A5').value = 'Filters Applied:';
+    worksheet.getCell('A5').font = { bold: true, underline: true };
 
-    let filterRow = 5;
+    let filterRow = 6;
     const filterEntries = Object.entries(reportData.filters).filter(
       ([_, value]) => value,
     );

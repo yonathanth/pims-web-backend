@@ -75,4 +75,9 @@ export class CreatePurchaseOrderItemDto {
   @IsString()
   @IsIn(['Complete', 'Pending', 'Partially Received', 'Cancelled'])
   status: string;
+
+  @ApiProperty({ description: 'Unit type ID', example: 1 })
+  @IsInt()
+  @Min(1)
+  unitTypeId: number;
 }

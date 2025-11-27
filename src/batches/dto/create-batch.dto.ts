@@ -84,4 +84,9 @@ export class CreateBatchDto {
   @IsInt()
   @Min(0)
   lowStockThreshold?: number;
+
+  @ApiProperty({ description: 'Unit type ID', example: 1 })
+  @IsInt()
+  @Min(1)
+  unitTypeId: number;
 }

@@ -786,8 +786,8 @@ export class ReportGenerationService {
     // Status filtering
     if (filters.status) {
       switch (filters.status) {
-        case 'completed':
-          where.status = 'completed'; // Use lowercase to match database
+        case 'approved':
+          where.status = 'approved'; // Use lowercase to match database
           break;
         case 'pending':
           where.status = 'pending'; // Use lowercase to match database

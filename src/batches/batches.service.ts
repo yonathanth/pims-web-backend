@@ -52,6 +52,15 @@ export class BatchesService {
         `Supplier with ID ${data.supplierId} not found`,
       );
 
+    // Validate unit type exists
+    const unitType = await this.prisma.unitType.findUnique({
+      where: { id: data.unitTypeId },
+    });
+    if (!unitType)
+      throw new NotFoundException(
+        `Unit type with ID ${data.unitTypeId} not found`,
+      );
+
     // Expiry after manufacture
     const mfg = new Date(data.manufactureDate);
     const exp = new Date(data.expiryDate);
@@ -103,6 +112,7 @@ export class BatchesService {
               batchNumber: normalizedBatchNumber,
               drugId: data.drugId,
               supplierId: data.supplierId,
+              unitTypeId: data.unitTypeId,
               manufactureDate: new Date(data.manufactureDate),
               expiryDate: new Date(data.expiryDate),
               unitPrice: data.unitPrice,
@@ -147,6 +157,7 @@ export class BatchesService {
             batchNumber: normalizedBatchNumber,
             drugId: data.drugId,
             supplierId: data.supplierId,
+            unitTypeId: data.unitTypeId,
             manufactureDate: new Date(data.manufactureDate),
             expiryDate: new Date(data.expiryDate),
             unitPrice: data.unitPrice,
@@ -173,7 +184,7 @@ export class BatchesService {
     query?: ListBatchesDto,
   ): Promise<
     PaginatedResult<
-      Batch & { drugSku: string; drugName: string; supplierName: string }
+      Batch & { drugSku: string; drugName: string; supplierName: string; unitTypeName?: string }
     >
   > {
     const page = query?.page ?? 1;
@@ -283,6 +294,12 @@ export class BatchesService {
               name: true,
             },
           },
+          unitType: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
         },
       }),
     ]);
@@ -296,12 +313,15 @@ export class BatchesService {
         batch.drug.tradeName,
       ),
       supplierName: batch.supplier.name,
+      unitTypeName: batch.unitType?.name,
       drug: undefined, // Remove the drug object
       supplier: undefined, // Remove the supplier object
+      unitType: undefined, // Remove the unitType object
     })) as (Batch & {
       drugSku: string;
       drugName: string;
       supplierName: string;
+      unitTypeName?: string;
     })[];
 
     // Apply low stock filtering with batch-specific thresholds
@@ -343,6 +363,12 @@ export class BatchesService {
             name: true,
           },
         },
+        unitType: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
       },
     });
     if (!batch) throw new NotFoundException(`Batch with ID ${id} not found`);
@@ -355,9 +381,11 @@ export class BatchesService {
         batch.drug.tradeName,
       ),
       supplierName: batch.supplier.name,
+      unitTypeName: batch.unitType?.name,
       drug: undefined, // Remove the drug object
       supplier: undefined, // Remove the supplier object
-    } as Batch & { drugSku: string; drugName: string; supplierName: string };
+      unitType: undefined, // Remove the unitType object (will be included in response)
+    } as Batch & { drugSku: string; drugName: string; supplierName: string; unitTypeName?: string };
   }
 
   @Audit({
@@ -390,6 +418,15 @@ export class BatchesService {
         if (!supplier)
           throw new NotFoundException(
             `Supplier with ID ${data.supplierId} not found`,
+          );
+      }
+      if (data.unitTypeId) {
+        const unitType = await this.prisma.unitType.findUnique({
+          where: { id: data.unitTypeId },
+        });
+        if (!unitType)
+          throw new NotFoundException(
+            `Unit type with ID ${data.unitTypeId} not found`,
           );
       }
 

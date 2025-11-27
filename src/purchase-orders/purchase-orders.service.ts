@@ -204,6 +204,7 @@ export class PurchaseOrdersService {
               purchaseOrderId: purchaseOrder.id,
               drugId: item.drugId,
               batchId: item.batchId,
+              unitTypeId: item.unitTypeId,
               quantityOrdered: item.quantityOrdered,
               quantityReceived:
                 typeof item.quantityReceived === 'number'
@@ -219,6 +220,7 @@ export class PurchaseOrdersService {
             include: {
               drug: true,
               batch: true,
+              unitType: true,
             },
           }),
         ),
@@ -280,6 +282,7 @@ export class PurchaseOrdersService {
             include: {
               drug: true,
               batch: true,
+              unitType: true,
             },
           },
         },
@@ -309,6 +312,7 @@ export class PurchaseOrdersService {
           include: {
             drug: true,
             batch: true,
+            unitType: true,
           },
         },
       },
@@ -455,11 +459,22 @@ export class PurchaseOrdersService {
       }
     }
 
+    // Validate unit type exists
+    const unitType = await this.prisma.unitType.findUnique({
+      where: { id: data.unitTypeId },
+    });
+    if (!unitType) {
+      throw new NotFoundException(
+        `Unit type with ID ${data.unitTypeId} not found`,
+      );
+    }
+
     return this.prisma.purchaseOrderItem.create({
       data: {
         purchaseOrderId,
         drugId: data.drugId,
         batchId: data.batchId,
+        unitTypeId: data.unitTypeId,
         quantityOrdered: data.quantityOrdered,
         quantityReceived:
           typeof data.quantityReceived === 'number' ? data.quantityReceived : 0,
@@ -473,6 +488,7 @@ export class PurchaseOrdersService {
       include: {
         drug: true,
         batch: true,
+        unitType: true,
       },
     });
   }
@@ -510,6 +526,18 @@ export class PurchaseOrdersService {
         }
       }
 
+      // Validate unit type if updating
+      if (data.unitTypeId) {
+        const unitType = await this.prisma.unitType.findUnique({
+          where: { id: data.unitTypeId },
+        });
+        if (!unitType) {
+          throw new NotFoundException(
+            `Unit type with ID ${data.unitTypeId} not found`,
+          );
+        }
+      }
+
       // Validate dates if provided
       if (data.manufactureDate && data.expiryDate) {
         const mfg = new Date(data.manufactureDate);
@@ -533,6 +561,7 @@ export class PurchaseOrdersService {
         include: {
           drug: true,
           batch: true,
+          unitType: true,
         },
       });
     } catch (error) {

@@ -30,7 +30,7 @@ export class BatchesController {
   constructor(private readonly batchesService: BatchesService) {}
 
   @Post()
-  @Roles(UserRole.ADMIN, UserRole.MANAGER)
+  @Roles(UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Create a new batch' })
   @ApiResponse({ status: 201, description: 'Batch created successfully.' })
   @ApiResponse({ status: 400, description: 'Bad request.' })
@@ -62,7 +62,7 @@ export class BatchesController {
   }
 
   @Patch(':id')
-  @Roles(UserRole.ADMIN, UserRole.MANAGER)
+  @Roles(UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Update batch by id' })
   @ApiResponse({ status: 200, description: 'Batch updated successfully.' })
   @ApiResponse({ status: 404, description: 'Batch not found.' })

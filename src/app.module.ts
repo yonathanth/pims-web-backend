@@ -20,6 +20,7 @@ import { ReportsModule } from './reports/reports.module';
 import { DashboardModule } from './dashboard/dashboard.module';
 import { SalesModule } from './sales/sales.module';
 import { AnalyticsModule } from './analytics/analytics.module';
+import { UnitTypesModule } from './unit-types/unit-types.module';
 
 @Module({
   imports: [
@@ -45,6 +46,7 @@ import { AnalyticsModule } from './analytics/analytics.module';
     DashboardModule,
     SalesModule,
     AnalyticsModule,
+    UnitTypesModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -22,6 +22,14 @@ export class PdfGenerationService {
         doc.on('end', () => resolve(Buffer.concat(buffers)));
         doc.on('error', reject);
 
+        // Add pharmacy name
+        doc
+          .fontSize(16)
+          .font('Helvetica-Bold')
+          .text('Liyuwork Pharmacy - Central Ethiopia, Hadiya, Hossana,', { align: 'center' });
+
+        doc.moveDown(0.5);
+
         // Add title
         doc
           .fontSize(20)

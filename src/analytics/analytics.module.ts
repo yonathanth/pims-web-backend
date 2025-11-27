@@ -9,5 +9,6 @@ import { GeneralConfigsModule } from '../general-configs/general-configs.module'
   imports: [PrismaModule, GeneralConfigsModule],
   controllers: [AnalyticsController],
   providers: [AnalyticsService, AnalyticsUploaderService],
+  exports: [AnalyticsUploaderService],
 })
 export class AnalyticsModule {}

@@ -26,7 +26,7 @@ export enum PurchaseOrderStatus {
 
 export enum TransactionStatus {
   ALL_STATUS = 'all_status',
-  COMPLETED = 'completed',
+  APPROVED = 'approved',
   PENDING = 'pending',
   DECLINED = 'declined',
 }

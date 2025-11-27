@@ -1,7 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import axios from 'axios';
 import { AnalyticsService } from './analytics.service';
+import { GeneralConfigsService } from '../general-configs/general-configs.service';
 import {
   AnalyticsResponse,
   KeyMetric,
@@ -10,6 +11,7 @@ import {
   TopPerformerDto,
   CategorySlice,
   MonthlySeriesPoint,
+  TimeFilter,
 } from './dto/analytics.dto';
 import {
   AnalyticsUploadStatusDto,
@@ -24,7 +26,7 @@ type UploadAttemptResult = {
 type UploadStatusState = Omit<AnalyticsUploadStatusDto, 'running'>;
 
 @Injectable()
-export class AnalyticsUploaderService {
+export class AnalyticsUploaderService implements OnModuleInit {
   private readonly logger = new Logger(AnalyticsUploaderService.name);
   private previousHash: string | null = null;
   private running = false;
@@ -37,10 +39,39 @@ export class AnalyticsUploaderService {
     lastSkipReason: null,
     lastError: null,
   };
+  private readonly CONFIG_KEY_LAST_SUCCESS = 'analytics_upload_last_success_at';
+  private readonly CONFIG_KEY_LAST_HASH = 'analytics_upload_last_hash';
 
-  constructor(private readonly analyticsService: AnalyticsService) {}
+  constructor(
+    private readonly analyticsService: AnalyticsService,
+    private readonly generalConfigs: GeneralConfigsService,
+  ) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  async onModuleInit() {
+    // Load persisted lastSuccessAt and hash from database
+    try {
+      const lastSuccessConfig = await this.generalConfigs
+        .getTypedValue<string>(this.CONFIG_KEY_LAST_SUCCESS, 'string')
+        .catch(() => null);
+      const lastHashConfig = await this.generalConfigs
+        .getTypedValue<string>(this.CONFIG_KEY_LAST_HASH, 'string')
+        .catch(() => null);
+
+      if (lastSuccessConfig) {
+        this.status.lastSuccessAt = lastSuccessConfig;
+        this.logger.debug(`Loaded persisted lastSuccessAt: ${lastSuccessConfig}`);
+      }
+      if (lastHashConfig) {
+        this.previousHash = lastHashConfig;
+        this.status.lastHash = lastHashConfig;
+        this.logger.debug(`Loaded persisted lastHash: ${lastHashConfig}`);
+      }
+    } catch (error) {
+      this.logger.warn('Failed to load persisted upload status:', error);
+    }
+  }
+
+  @Cron(CronExpression.EVERY_HOUR)
   async pushIfChanged() {
     await this.runUpload(false);
   }
@@ -90,6 +121,8 @@ export class AnalyticsUploaderService {
     }
 
     const attemptStart = Date.now();
+    // Construct URL outside try block so it's accessible in catch
+    const url = `${baseUrl.replace(/\/$/, '')}/api/analytics/${encodeURIComponent(pharmacyId)}`;
     try {
       this.running = true;
       this.status.lastAttemptAt = new Date().toISOString();
@@ -98,9 +131,33 @@ export class AnalyticsUploaderService {
       this.status.lastDurationMs = null;
       this.status.lastResponseCode = null;
 
-      // Get current analytics snapshot from local service (default window)
-      const analytics = await this.analyticsService.getAnalytics({});
+      // Get today's date in ISO format (YYYY-MM-DD) for daily snapshot
+      const today = new Date();
+      const todayISO = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+      
+      this.logger.debug(`Fetching daily analytics snapshot for date: ${todayISO}`);
+      
+      // Get analytics snapshot for exact current date (not last 24 hours)
+      let analytics: AnalyticsResponse;
+      try {
+        analytics = await this.analyticsService.getAnalytics({
+          timeFilter: TimeFilter.Date,
+          dateIso: todayISO,
+        });
+      } catch (error: any) {
+        this.logger.error(`Failed to fetch analytics data: ${error?.message || String(error)}`);
+        throw new Error(`Analytics data fetch failed: ${error?.message || String(error)}`);
+      }
+      
+      // Validate analytics response has required data
+      if (!analytics) {
+        throw new Error('Analytics service returned null or undefined');
+      }
+      
       const payload = this.mapToRemotePayload(analytics);
+      
+      // Log payload summary for debugging
+      this.logger.debug(`Payload summary: ${payload.metrics?.length || 0} metrics, ${payload.inventory_cards?.length || 0} inventory cards, ${payload.distribution_by_category?.length || 0} categories, ${payload.fast_moving_products?.length || 0} fast moving, ${payload.slow_moving_products?.length || 0} slow moving`);
 
       // Compute content hash over the analytics payload only
       const json = JSON.stringify(payload);
@@ -118,28 +175,55 @@ export class AnalyticsUploaderService {
       }
 
       // Send to remote server
-      const url = `${baseUrl.replace(/\/$/, '')}/api/analytics/${encodeURIComponent(pharmacyId)}`;
+      // uploadedAt should match what cloud API expects (ISO8601 string)
+      // Cloud API uses this to set Pharmacy.lastUpdatedAt
+      const uploadedAt = new Date().toISOString();
       const body = {
         analytics: payload,
         hash,
-        uploadedAt: new Date().toISOString(),
+        uploadedAt,
       };
+      
+      this.logger.debug(`Upload timestamp: ${uploadedAt}`);
+
+      this.logger.debug(`Attempting upload to: ${url}`);
+      this.logger.debug(`Payload size: ${JSON.stringify(body).length} bytes`);
 
       const response = await axios.post(url, body, {
         headers: {
           'x-api-key': apiKey,
           'content-type': 'application/json',
         },
-        timeout: 15000,
+        timeout: 60000, // Increased from 15s to 60s
         // Validate status 2xx as success
         validateStatus: (s) => s >= 200 && s < 300,
       });
 
       this.previousHash = hash;
-      this.status.lastSuccessAt = new Date().toISOString();
+      const successTimestamp = new Date().toISOString();
+      this.status.lastSuccessAt = successTimestamp;
       this.status.lastHash = hash;
       this.status.lastResponseCode = response.status;
       this.status.lastDurationMs = Date.now() - attemptStart;
+      
+      // Persist lastSuccessAt and hash to database
+      try {
+        await this.generalConfigs.setTypedValue(
+          this.CONFIG_KEY_LAST_SUCCESS,
+          successTimestamp,
+          'string',
+        );
+        await this.generalConfigs.setTypedValue(
+          this.CONFIG_KEY_LAST_HASH,
+          hash,
+          'string',
+        );
+        this.logger.debug('Persisted upload status to database');
+      } catch (error) {
+        this.logger.warn('Failed to persist upload status:', error);
+        // Don't fail the upload if persistence fails
+      }
+      
       this.logger.log('Analytics snapshot uploaded');
       return {
         outcome: 'uploaded',
@@ -154,15 +238,58 @@ export class AnalyticsUploaderService {
       const axiosCode = err?.code || null;
       const msg = err?.message || String(err);
       const label = httpStatus ?? axiosCode ?? 'no-code';
-      this.logger.warn(`Upload failed (${label}): ${msg}`);
-      this.status.lastError = msg;
+      
+      // Enhanced error logging
+      const errorDetails: any = {
+        label,
+        message: msg,
+        url: url,
+      };
+      if (httpStatus) {
+        errorDetails.httpStatus = httpStatus;
+        errorDetails.responseData = err?.response?.data;
+      }
+      if (axiosCode) {
+        errorDetails.axiosCode = axiosCode;
+      }
+      
+      this.logger.warn(`Upload failed (${label}): ${msg}`, errorDetails);
+      
+      // Build user-friendly error message
+      let userMessage = msg;
+      if (axiosCode === 'ECONNREFUSED' || axiosCode === 'ENOTFOUND') {
+        userMessage = `Cannot connect to remote server. Check network and URL: ${baseUrl}`;
+      } else if (axiosCode === 'ETIMEDOUT') {
+        userMessage = 'Upload timed out after 60 seconds. Server may be slow or unreachable.';
+      } else if (httpStatus === 401 || httpStatus === 403) {
+        userMessage = `Authentication failed (${httpStatus}). Check API key.`;
+      } else if (httpStatus === 404) {
+        // Check if response is HTML (likely Next.js frontend, not API)
+        const isHtmlResponse = err?.response?.data && 
+          typeof err.response.data === 'string' && 
+          err.response.data.includes('<!DOCTYPE html>');
+        
+        if (isHtmlResponse) {
+          userMessage = `API endpoint not found (404). The domain appears to be serving a frontend, not the API. Check if:
+1. Cloud API is running and accessible
+2. Base URL includes correct port (e.g., :64387) or subdomain (e.g., api.leyuworkpharmacy.com.et)
+3. Reverse proxy is configured to route /api/* to the NestJS backend
+Current URL: ${url}`;
+        } else {
+          userMessage = `Endpoint not found (404). Check URL path: ${url}`;
+        }
+      } else if (httpStatus) {
+        userMessage = `Server error (${httpStatus}): ${msg}`;
+      }
+      
+      this.status.lastError = userMessage;
       this.status.lastResponseCode = httpStatus;
       if (!httpStatus && axiosCode) {
-        this.status.lastError = `${axiosCode}: ${msg}`;
+        this.status.lastError = `${axiosCode}: ${userMessage}`;
       }
       return {
         outcome: 'error',
-        message: msg,
+        message: userMessage,
       };
     } finally {
       this.running = false;
@@ -179,25 +306,31 @@ export class AnalyticsUploaderService {
   }
 
   // Map internal AnalyticsResponse (camelCase) to remote expected snake_case contract
+  // Only includes: General cards (metrics), Inventory tab, and Sales tab data
   private mapToRemotePayload(a: AnalyticsResponse) {
     return {
+      // General cards (summary cards above tabs)
       metrics: a.metrics.map(this.mapKeyMetric),
+      
+      // Inventory tab data
       inventory_cards: a.inventoryCards.map(this.mapKeyMetric),
       distribution_by_category: a.distributionByCategory.map(
         this.mapCategorySlice,
       ),
       monthly_stocked_vs_sold: a.monthlyStockedVsSold.map(this.mapMonthlyPoint),
-      top_suppliers: a.topSuppliers.map(this.mapSupplier),
-      top_performers: a.topPerformers.map(this.mapPerformer),
       out_of_stock_products: a.outOfStockProducts.map(this.mapProduct),
       expired_products: a.expiredProducts.map(this.mapProduct),
       soon_to_be_out_of_stock_products: a.soonToBeOutOfStockProducts.map(
         this.mapProduct,
       ),
       soon_to_expire_products: a.soonToExpireProducts.map(this.mapProduct),
+      
+      // Sales tab data
       fast_moving_products: a.fastMovingProducts.map(this.mapProduct),
       slow_moving_products: a.slowMovingProducts.map(this.mapProduct),
-      most_ordered_products: a.mostOrderedProducts.map(this.mapProduct),
+      
+      // Note: Removed top_suppliers, top_performers, most_ordered_products
+      // as they belong to Supply and Employee tabs, not Sales/Inventory
     };
   }
 

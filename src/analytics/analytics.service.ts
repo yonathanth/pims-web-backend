@@ -84,6 +84,7 @@ export class AnalyticsService {
           in: [...AnalyticsService.SALE_TYPES],
           mode: 'insensitive',
         },
+        status: 'approved',
         transactionDate: { gte: start, lt: end },
       },
       include: { batch: true },
@@ -101,6 +102,7 @@ export class AnalyticsService {
           in: [...AnalyticsService.SALE_TYPES],
           mode: 'insensitive',
         },
+        status: 'approved',
         transactionDate: { gte: start, lt: end },
       },
       include: { batch: true },
@@ -121,6 +123,7 @@ export class AnalyticsService {
           in: [...AnalyticsService.SALE_TYPES],
           mode: 'insensitive',
         },
+        status: 'approved',
         transactionDate: { gte: start, lt: end },
       },
     });
@@ -162,6 +165,7 @@ export class AnalyticsService {
           in: [...AnalyticsService.SALE_TYPES],
           mode: 'insensitive',
         },
+        status: 'approved',
         transactionDate: { gte: start, lt: end },
       },
       include: { batch: true },
@@ -181,6 +185,7 @@ export class AnalyticsService {
           in: [...AnalyticsService.SALE_TYPES],
           mode: 'insensitive',
         },
+        status: 'approved',
         transactionDate: { gte: start, lt: end },
       },
       include: { batch: true },
@@ -225,13 +230,18 @@ export class AnalyticsService {
     return result._sum.currentQty || 0;
   }
 
-  private async expiringInDays(days: number): Promise<number> {
-    const now = new Date();
-    const until = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+  private async expiringInDays(
+    days: number,
+    referenceDate?: Date,
+  ): Promise<number> {
+    // If referenceDate is provided, use it; otherwise use current date
+    // This allows calculating expiring items as of a specific date (e.g., end of time filter period)
+    const refDate = referenceDate || new Date();
+    const until = new Date(refDate.getTime() + days * 24 * 60 * 60 * 1000);
     return await this.prisma.batch.count({
       where: {
         expiryDate: {
-          gte: now,
+          gte: refDate,
           lte: until,
         },
       },
@@ -318,7 +328,7 @@ export class AnalyticsService {
     >`
       SELECT b."drugId" as "drugId",
              COALESCE(CAST(SUM(CASE WHEN LOWER(t."transactionType") IN ('receive','in') THEN t.quantity ELSE 0 END) AS DOUBLE PRECISION), 0) AS received,
-             COALESCE(CAST(SUM(CASE WHEN LOWER(t."transactionType") IN ('sale') THEN t.quantity ELSE 0 END) AS DOUBLE PRECISION), 0) AS sold
+             COALESCE(CAST(SUM(CASE WHEN LOWER(t."transactionType") IN ('sale') AND t."status" = 'approved' THEN t.quantity ELSE 0 END) AS DOUBLE PRECISION), 0) AS sold
       FROM "transactions" t
       JOIN "batches" b ON b.id = t."batchId"
       WHERE t."transactionDate" >= ${start} AND t."transactionDate" < ${end}
@@ -362,6 +372,7 @@ export class AnalyticsService {
           in: [...AnalyticsService.SALE_TYPES],
           mode: 'insensitive',
         },
+        status: 'approved',
         transactionDate: { gte: start, lt: end },
       },
       orderBy: { _sum: { quantity: 'desc' } },
@@ -530,6 +541,7 @@ export class AnalyticsService {
           in: [...AnalyticsService.SALE_TYPES],
           mode: 'insensitive',
         },
+        status: 'approved',
         transactionDate: { gte: start, lt: end },
       },
     });
@@ -558,7 +570,10 @@ export class AnalyticsService {
     return withUsers.slice(0, limit);
   }
 
-  private async distributionByCategory(): Promise<CategorySlice[]> {
+  private async distributionByCategory(
+    start?: Date,
+    end?: Date,
+  ): Promise<CategorySlice[]> {
     const categories = await this.prisma.category.findMany({
       include: {
         drugs: {
@@ -583,18 +598,27 @@ export class AnalyticsService {
           0,
         );
         // Calculate soldQty from transactions via batch -> drug -> category relationship
+        // Now filtered by time range if provided
         const batchIds = c.drugs.flatMap((d) => d.batches.map((b) => b.id));
         let soldQty = 0;
         if (batchIds.length > 0) {
+          const whereClause: any = {
+            transactionType: {
+              in: [...AnalyticsService.SALE_TYPES],
+              mode: 'insensitive',
+            },
+            status: 'approved',
+            batchId: { in: batchIds },
+          };
+          // Add time filter if provided
+          if (start || end) {
+            whereClause.transactionDate = {};
+            if (start) whereClause.transactionDate.gte = start;
+            if (end) whereClause.transactionDate.lt = end;
+          }
           const soldResult = await this.prisma.transaction.aggregate({
             _sum: { quantity: true },
-            where: {
-              transactionType: {
-                in: [...AnalyticsService.SALE_TYPES],
-                mode: 'insensitive',
-              },
-              batchId: { in: batchIds },
-            },
+            where: whereClause,
           });
           soldQty = soldResult._sum.quantity || 0;
         }
@@ -605,16 +629,38 @@ export class AnalyticsService {
 
   private async monthlyStockedVsSold(
     monthsBack: number,
+    start?: Date,
+    end?: Date,
   ): Promise<MonthlySeriesPoint[]> {
-    // Returns monthly stocked (receipts) vs sold quantities for the past `monthsBack` months.
-    const now = new Date();
+    // Returns monthly stocked (receipts) vs sold quantities.
+    // If start/end dates are provided, use those; otherwise use monthsBack from now.
+    const now = end || new Date();
     const months: { start: Date; end: Date; label: string }[] = [];
-    for (let i = monthsBack - 1; i >= 0; i--) {
-      const start = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      const end = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
-      const label = `${start.getFullYear()}-${(start.getMonth() + 1).toString().padStart(2, '0')}`;
-      months.push({ start, end, label });
+    
+    if (start && end) {
+      // Use custom date range - break it into months
+      const rangeStart = new Date(start);
+      const rangeEnd = new Date(end);
+      let currentMonth = new Date(rangeStart.getFullYear(), rangeStart.getMonth(), 1);
+      
+      while (currentMonth < rangeEnd) {
+        const monthStart = currentMonth > rangeStart ? currentMonth : rangeStart;
+        const nextMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 1);
+        const monthEnd = nextMonth < rangeEnd ? nextMonth : rangeEnd;
+        const label = `${currentMonth.getFullYear()}-${(currentMonth.getMonth() + 1).toString().padStart(2, '0')}`;
+        months.push({ start: monthStart, end: monthEnd, label });
+        currentMonth = nextMonth;
+      }
+    } else {
+      // Use monthsBack from now (default behavior)
+      for (let i = monthsBack - 1; i >= 0; i--) {
+        const monthStart = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        const monthEnd = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
+        const label = `${monthStart.getFullYear()}-${(monthStart.getMonth() + 1).toString().padStart(2, '0')}`;
+        months.push({ start: monthStart, end: monthEnd, label });
+      }
     }
+    
     const points: MonthlySeriesPoint[] = [];
     for (const m of months) {
       // Stocked: sum of 'receive'/'in' transactions in this month
@@ -628,7 +674,7 @@ export class AnalyticsService {
           transactionDate: { gte: m.start, lt: m.end },
         },
       });
-      // Sold: sum of 'sale' transactions in this month
+      // Sold: sum of 'sale' transactions in this month (only approved sales)
       const soldAgg = await this.prisma.transaction.aggregate({
         _sum: { quantity: true },
         where: {
@@ -636,6 +682,7 @@ export class AnalyticsService {
             in: [...AnalyticsService.SALE_TYPES],
             mode: 'insensitive',
           },
+          status: 'approved',
           transactionDate: { gte: m.start, lt: m.end },
         },
       });
@@ -720,12 +767,15 @@ export class AnalyticsService {
     days: number,
     limit: number,
     offset: number,
+    referenceDate?: Date,
   ): Promise<ProductDto[]> {
-    const now = new Date();
-    const until = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+    // If referenceDate is provided, use it; otherwise use current date
+    // This allows calculating expiring items as of a specific date (e.g., end of time filter period)
+    const refDate = referenceDate || new Date();
+    const until = new Date(refDate.getTime() + days * 24 * 60 * 60 * 1000);
     const batches = await this.prisma.batch.findMany({
       where: {
-        expiryDate: { gte: now, lte: until },
+        expiryDate: { gte: refDate, lte: until },
       },
       include: { drug: true, locationBatches: true },
       skip: offset,
@@ -807,6 +857,7 @@ export class AnalyticsService {
           in: [...AnalyticsService.SALE_TYPES],
           mode: 'insensitive',
         },
+        status: 'approved',
         transactionDate: { gte: start, lt: end },
       },
       orderBy: { _sum: { quantity: 'desc' } },
@@ -861,7 +912,7 @@ export class AnalyticsService {
       include: { drug: true, locationBatches: true },
     });
 
-    // Get sales data for the period
+    // Get sales data for the period (only approved sales)
     const salesData = await this.prisma.transaction.groupBy({
       by: ['batchId'],
       _sum: { quantity: true },
@@ -870,6 +921,7 @@ export class AnalyticsService {
           in: [...AnalyticsService.SALE_TYPES],
           mode: 'insensitive',
         },
+        status: 'approved',
         transactionDate: { gte: start, lt: end },
       },
     });
@@ -1002,7 +1054,8 @@ export class AnalyticsService {
     const totalStockValueCurrent = await this.totalStockValue();
     const totalItemsCurrent = await this.totalItems();
     const expiredItemsCurrent = await this.expiredBatchesAsOf(currentEnd);
-    const expiring30Current = await this.expiringInDays(30);
+    // Use currentEnd as reference to show items expiring within 30 days from the end of the selected period
+    const expiring30Current = await this.expiringInDays(30, currentEnd);
     const lowStockCurrent = await this.lowStockCount(
       effectiveLowStockThreshold,
     );
@@ -1084,15 +1137,31 @@ export class AnalyticsService {
     const expiredItemsTrendUp = expiredItemsCurrent <= prevExpiredItems;
     const delayedPoTrendUp = delayedPoCurrent === 0;
 
-    const distribution = await this.distributionByCategory();
-    const monthly = await this.monthlyStockedVsSold(12);
+    // Pass time range to distributionByCategory so soldQty respects the time filter
+    const distribution = await this.distributionByCategory(
+      currentStart,
+      currentEnd,
+    );
+    // Pass time range to monthlyStockedVsSold to respect the time filter
+    // Calculate months based on the time range, or default to 12 months if range is too large
+    const daysDiff = Math.ceil(
+      (currentEnd.getTime() - currentStart.getTime()) / (1000 * 60 * 60 * 24),
+    );
+    const monthsInRange = Math.max(1, Math.ceil(daysDiff / 30));
+    const monthly = await this.monthlyStockedVsSold(
+      monthsInRange > 12 ? 12 : monthsInRange,
+      currentStart,
+      currentEnd,
+    );
 
     const outOfStockProducts = await this.outOfStockProducts(tableLimit, 0);
     const expiredProducts = await this.expiredProducts(tableLimit, 0);
+    // Use currentEnd as reference to show products expiring within 30 days from the end of selected period
     const soonToExpireProducts = await this.soonToExpireProducts(
       30,
       tableLimit,
       0,
+      currentEnd,
     );
     const soonToBeOutOfStockProducts = await this.soonToBeOutOfStockProducts(
       effectiveLowStockThreshold,
