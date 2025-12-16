@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsString, IsNotEmpty, IsOptional, IsEmail } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsEmail, ValidateIf } from 'class-validator';
 
 export class CreateSupplierDto {
   @ApiProperty({
@@ -32,8 +32,8 @@ export class CreateSupplierDto {
     example: 'contact@medsupply.com',
     required: false,
   })
+  @ValidateIf((o) => o.email !== undefined && o.email !== null && o.email !== '')
   @IsEmail()
-  @IsOptional()
   email?: string;
 
   @ApiProperty({

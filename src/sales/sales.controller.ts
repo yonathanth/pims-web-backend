@@ -30,7 +30,7 @@ export class SalesController {
   constructor(private readonly salesService: SalesService) {}
 
   @Get('pending')
-  @Roles(UserRole.SELLER, UserRole.ADMIN)
+  @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Get pending sales for approval' })
   @ApiResponse({
     status: 200,
@@ -48,7 +48,7 @@ export class SalesController {
   }
 
   @Get()
-  @Roles(UserRole.SELLER, UserRole.ADMIN)
+  @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Get all sales with pagination' })
   @ApiResponse({
     status: 200,
@@ -66,7 +66,7 @@ export class SalesController {
   }
 
   @Post(':id/approve')
-  @Roles(UserRole.SELLER, UserRole.ADMIN)
+  @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Approve a pending sale' })
   @ApiParam({ name: 'id', description: 'Sale transaction ID' })
   @ApiBody({ type: ApproveSaleDto })
@@ -89,7 +89,7 @@ export class SalesController {
   }
 
   @Post(':id/decline')
-  @Roles(UserRole.SELLER, UserRole.ADMIN)
+  @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Decline a pending sale' })
   @ApiParam({ name: 'id', description: 'Sale transaction ID' })
   @ApiBody({ type: DeclineSaleDto })

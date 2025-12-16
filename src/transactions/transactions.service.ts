@@ -77,6 +77,7 @@ export class TransactionsService {
           batchId: dto.batchId,
           transactionType: dto.transactionType,
           quantity: dto.quantity,
+          unitPrice: batch.unitPrice,
           userId,
           notes: dto.notes,
           status:

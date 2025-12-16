@@ -26,10 +26,10 @@ export class CreateDrugDto {
   @IsNotEmpty()
   strength: string;
 
-  @ApiProperty({ description: 'Description', example: 'Antibiotic' })
+  @ApiProperty({ description: 'Description', example: 'Antibiotic', required: false })
   @IsString()
-  @IsNotEmpty()
-  description: string;
+  @IsOptional()
+  description?: string;
 
   @ApiProperty({ description: 'Category ID' })
   @IsInt()

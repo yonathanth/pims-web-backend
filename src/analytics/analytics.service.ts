@@ -90,7 +90,7 @@ export class AnalyticsService {
       include: { batch: true },
     });
     return transactions.reduce(
-      (sum, t) => sum + t.quantity * (t.batch?.unitPrice || 0),
+      (sum, t) => sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
       0,
     );
   }
@@ -110,7 +110,7 @@ export class AnalyticsService {
     return transactions.reduce(
       (sum, t) =>
         sum +
-        t.quantity * ((t.batch?.unitPrice || 0) - (t.batch?.unitCost || 0)),
+        t.quantity * (((t as any).unitPrice ?? t.batch?.unitPrice ?? 0) - (t.batch?.unitCost || 0)),
       0,
     );
   }
@@ -171,7 +171,7 @@ export class AnalyticsService {
       include: { batch: true },
     });
     const totalValue = transactions.reduce(
-      (sum, t) => sum + t.quantity * (t.batch?.unitPrice || 0),
+      (sum, t) => sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
       0,
     );
     const totalQty = transactions.reduce((sum, t) => sum + t.quantity, 0);
@@ -208,7 +208,7 @@ export class AnalyticsService {
       include: { batch: true },
     });
     return transactions.reduce(
-      (sum, t) => sum + t.quantity * (t.batch?.unitPrice || 0),
+      (sum, t) => sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
       0,
     );
   }

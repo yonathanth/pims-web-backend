@@ -53,8 +53,8 @@ export class DashboardService {
     });
 
     const totalProfit = salesTransactions.reduce((sum, transaction) => {
-      const profitPerUnit =
-        transaction.batch.unitPrice - transaction.batch.unitCost;
+      const unitPrice = (transaction as any).unitPrice ?? transaction.batch.unitPrice;
+      const profitPerUnit = unitPrice - transaction.batch.unitCost;
       return sum + transaction.quantity * profitPerUnit;
     }, 0);
 

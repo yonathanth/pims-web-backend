@@ -255,8 +255,8 @@ export class ReportGenerationService {
           ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
           : transaction.batch.drug.genericName,
         quantitySold: transaction.quantity,
-        unitPrice: transaction.batch.unitPrice,
-        totalPrice: transaction.quantity * transaction.batch.unitPrice,
+        unitPrice: transaction.unitPrice ?? transaction.batch.unitPrice,
+        totalPrice: transaction.quantity * (transaction.unitPrice ?? transaction.batch.unitPrice),
         user: transaction.user?.fullName || 'Unknown User',
         category: transaction.batch.drug.category.name,
         status: transaction.status || 'pending', // Add status with fallback
@@ -334,8 +334,8 @@ export class ReportGenerationService {
         ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
         : transaction.batch.drug.genericName,
       quantitySold: transaction.quantity,
-      unitPrice: transaction.batch.unitPrice,
-      totalPrice: transaction.quantity * transaction.batch.unitPrice,
+      unitPrice: transaction.unitPrice ?? transaction.batch.unitPrice,
+      totalPrice: transaction.quantity * (transaction.unitPrice ?? transaction.batch.unitPrice),
       user: transaction.user?.fullName || 'Unknown User',
       category: transaction.batch.drug.category.name,
       status: transaction.status || 'pending', // Add status with fallback

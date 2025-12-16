@@ -31,9 +31,10 @@ export class CreateBatchDto {
   @Min(1)
   supplierId: number;
 
-  @ApiProperty({ description: 'Manufacture date', example: '2024-01-15' })
+  @ApiProperty({ description: 'Manufacture date', example: '2024-01-15', required: false })
+  @IsOptional()
   @IsDateString()
-  manufactureDate: string;
+  manufactureDate?: string;
 
   @ApiProperty({ description: 'Expiry date', example: '2026-01-15' })
   @IsDateString()

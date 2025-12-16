@@ -4,12 +4,21 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { ApproveSaleDto, DeclineSaleDto, SalesQueryDto } from './dto';
+import {
+  ApproveSaleDto,
+  DeclineSaleDto,
+  SalesQueryDto,
+  CreateSaleDto,
+} from './dto';
 import { TransactionType } from '../transactions/dto/create-transaction.dto';
+import { AuditLogService } from '../audit-log/audit-log.service';
 
 @Injectable()
 export class SalesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auditLogService: AuditLogService,
+  ) {}
 
   async getPendingSales() {
     try {
@@ -37,14 +46,15 @@ export class SalesService {
 
       return pendingSales.map((transaction) => ({
         id: transaction.id,
+        saleId: transaction.saleId ?? undefined,
         drugName: transaction.batch.drug.tradeName
           ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
           : transaction.batch.drug.genericName,
         sku: transaction.batch.drug.sku,
         category: transaction.batch.drug.category.name,
         quantity: transaction.quantity,
-        unitPrice: transaction.batch.unitPrice,
-        totalPrice: transaction.quantity * transaction.batch.unitPrice,
+        unitPrice: transaction.unitPrice ?? transaction.batch.unitPrice,
+        totalPrice: transaction.quantity * (transaction.unitPrice ?? transaction.batch.unitPrice),
         customerName:
           transaction.user?.fullName ||
           transaction.user?.username ||
@@ -142,8 +152,8 @@ export class SalesService {
         sku: transaction.batch.drug.sku,
         category: transaction.batch.drug.category.name,
         quantity: transaction.quantity,
-        unitPrice: transaction.batch.unitPrice,
-        totalPrice: transaction.quantity * transaction.batch.unitPrice,
+        unitPrice: transaction.unitPrice ?? transaction.batch.unitPrice,
+        totalPrice: transaction.quantity * (transaction.unitPrice ?? transaction.batch.unitPrice),
         customerName:
           transaction.user?.fullName ||
           transaction.user?.username ||
@@ -173,6 +183,85 @@ export class SalesService {
       console.error('Error getting sales:', error);
       throw error;
     }
+  }
+
+  /**
+   * Create a grouped sale (Sale header + multiple Transaction rows).
+   * Uses userId as the seller who created the sale group.
+   * Note: This is implemented without a long-lived DB transaction to avoid
+   * interactive transaction timeouts in constrained environments.
+   */
+  async createGroupedSale(dto: CreateSaleDto, userId: number) {
+    if (!dto.items || dto.items.length === 0) {
+      throw new BadRequestException('Sale must contain at least one item');
+    }
+
+    if (!userId) {
+      throw new BadRequestException(
+        'User information is required to create a sale',
+      );
+    }
+
+    // First create the sale header
+    const sale = await this.prisma.sale.create({
+      data: {
+        status: 'pending',
+        notes: dto.notes,
+      },
+    });
+
+    // Then process each line item individually
+    for (const item of dto.items) {
+      const batch = await this.prisma.batch.findUnique({
+        where: { id: item.batchId },
+      });
+
+      if (!batch) {
+        throw new NotFoundException(`Batch with ID ${item.batchId} not found`);
+      }
+
+      const delta = -item.quantity; // sale reduces stock
+      if (batch.currentQty + delta < 0) {
+        throw new BadRequestException(
+          `Insufficient quantity for batch ${item.batchId}. Available: ${batch.currentQty}, Requested: ${item.quantity}`,
+        );
+      }
+
+      const updatedBatch = await this.prisma.batch.update({
+        where: { id: batch.id },
+        data: { currentQty: { increment: delta } },
+      });
+
+      if (updatedBatch.currentQty < 0) {
+        throw new BadRequestException(
+          'Insufficient batch quantity for this transaction',
+        );
+      }
+
+      await this.prisma.transaction.create({
+        data: {
+          batchId: item.batchId,
+          transactionType: TransactionType.SALE,
+          quantity: item.quantity,
+          unitPrice: batch.unitPrice,
+          userId,
+          notes: item.lineNotes ?? dto.notes,
+          status: 'pending',
+          saleId: sale.id,
+        },
+      });
+    }
+
+    // Audit log for sale creation
+    this.auditLogService.logAsync({
+      action: 'CREATE',
+      entityName: 'Sale',
+      entityId: sale.id,
+      userId,
+      changeSummary: `Created sale with ${dto.items.length} items`,
+    });
+
+    return sale;
   }
 
   async approveSale(id: number, approveSaleDto: ApproveSaleDto) {
@@ -243,5 +332,157 @@ export class SalesService {
       console.error('Error declining sale:', error);
       throw error;
     }
+  }
+
+  /**
+   * Approve all pending transactions belonging to a given Sale in one go.
+   */
+  async approveSaleGroup(
+    saleId: number,
+    approveSaleDto: ApproveSaleDto,
+    userId: number,
+  ) {
+    const sale = await this.prisma.sale.findUnique({
+      where: { id: saleId },
+      include: {
+        transactions: true,
+      },
+    });
+
+    if (!sale) {
+      throw new NotFoundException('Sale group not found');
+    }
+
+    if (sale.status !== 'pending') {
+      throw new BadRequestException(
+        `Sale group is not pending. Current status: ${sale.status}`,
+      );
+    }
+
+    const nonPending = sale.transactions.filter(
+      (t) => t.status && t.status !== 'pending',
+    );
+
+    if (nonPending.length > 0) {
+      throw new BadRequestException(
+        'Cannot approve sale group because some line items are not pending',
+      );
+    }
+
+    const notesToApply = approveSaleDto.notes;
+
+    const updatedSale = await this.prisma.$transaction(async (tx) => {
+      // Update all transactions to approved
+      await tx.transaction.updateMany({
+        where: { saleId },
+        data: {
+          status: 'approved',
+          ...(notesToApply && { notes: notesToApply }),
+          updatedAt: new Date(),
+        },
+      });
+
+      // Update sale header
+      return tx.sale.update({
+        where: { id: saleId },
+        data: {
+          status: 'approved',
+          notes: notesToApply ?? sale.notes,
+          updatedAt: new Date(),
+        },
+      });
+    });
+
+    // Audit log
+    this.auditLogService.logAsync({
+      action: 'UPDATE',
+      entityName: 'Sale',
+      entityId: saleId,
+      userId,
+      changeSummary: 'Approved sale group',
+    });
+
+    return {
+      message: 'Sale group approved successfully',
+      sale: updatedSale,
+    };
+  }
+
+  /**
+   * Decline all pending transactions belonging to a given Sale in one go and restore inventory.
+   */
+  async declineSaleGroup(
+    saleId: number,
+    declineSaleDto: DeclineSaleDto,
+    userId: number,
+  ) {
+    const sale = await this.prisma.sale.findUnique({
+      where: { id: saleId },
+      include: {
+        transactions: true,
+      },
+    });
+
+    if (!sale) {
+      throw new NotFoundException('Sale group not found');
+    }
+
+    if (sale.status !== 'pending') {
+      throw new BadRequestException(
+        `Sale group is not pending. Current status: ${sale.status}`,
+      );
+    }
+
+    const pendingTransactions = sale.transactions.filter(
+      (t) => !t.status || t.status === 'pending',
+    );
+
+    if (pendingTransactions.length === 0) {
+      throw new BadRequestException(
+        'Sale group has no pending transactions to decline',
+      );
+    }
+
+    const updatedSale = await this.prisma.$transaction(async (tx) => {
+      // Restore inventory and mark each transaction as declined
+      for (const transaction of pendingTransactions) {
+        await tx.batch.update({
+          where: { id: transaction.batchId },
+          data: { currentQty: { increment: transaction.quantity } },
+        });
+
+        await tx.transaction.update({
+          where: { id: transaction.id },
+          data: {
+            status: 'declined',
+            notes: `Declined: ${declineSaleDto.reason}`,
+            updatedAt: new Date(),
+          },
+        });
+      }
+
+      return tx.sale.update({
+        where: { id: saleId },
+        data: {
+          status: 'declined',
+          notes: `Declined: ${declineSaleDto.reason}`,
+          updatedAt: new Date(),
+        },
+      });
+    });
+
+    // Audit log
+    this.auditLogService.logAsync({
+      action: 'UPDATE',
+      entityName: 'Sale',
+      entityId: saleId,
+      userId,
+      changeSummary: 'Declined sale group',
+    });
+
+    return {
+      message: 'Sale group declined successfully',
+      sale: updatedSale,
+    };
   }
 }

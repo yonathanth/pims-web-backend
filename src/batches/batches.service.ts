@@ -5,7 +5,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { Batch, Prisma } from '@prisma/client';
+import { Batch, Prisma, UserRole } from '@prisma/client';
 import {
   CreateBatchDto,
   UpdateBatchDto,
@@ -14,12 +14,14 @@ import {
 } from './dto';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { Audit } from '../audit-log/audit.decorator';
+import { RequestContextService } from '../common/request-context.service';
 
 @Injectable()
 export class BatchesService {
   constructor(
     private prisma: PrismaService,
     private auditLogService: AuditLogService,
+    private requestContext: RequestContextService,
   ) {}
 
   // Helper function to format drug name as "genericName (tradeName)" or just "genericName"
@@ -61,13 +63,15 @@ export class BatchesService {
         `Unit type with ID ${data.unitTypeId} not found`,
       );
 
-    // Expiry after manufacture
-    const mfg = new Date(data.manufactureDate);
-    const exp = new Date(data.expiryDate);
-    if (exp <= mfg) {
-      throw new BadRequestException(
-        'Expiry date must be after manufacture date',
-      );
+    // Expiry after manufacture (only validate if manufactureDate is provided)
+    if (data.manufactureDate) {
+      const mfg = new Date(data.manufactureDate);
+      const exp = new Date(data.expiryDate);
+      if (exp <= mfg) {
+        throw new BadRequestException(
+          'Expiry date must be after manufacture date',
+        );
+      }
     }
 
     // Normalize batchNumber: convert empty string to null/undefined
@@ -107,20 +111,23 @@ export class BatchesService {
       // Create batch and mappings in a transaction
       try {
         const result = await this.prisma.$transaction(async (tx) => {
+          const batchData: any = {
+            batchNumber: normalizedBatchNumber,
+            drugId: data.drugId,
+            supplierId: data.supplierId,
+            unitTypeId: data.unitTypeId,
+            expiryDate: new Date(data.expiryDate),
+            unitPrice: data.unitPrice,
+            unitCost: data.unitCost,
+            purchaseDate: new Date(data.purchaseDate),
+            currentQty: data.currentQty ?? 0,
+            lowStockThreshold: data.lowStockThreshold ?? 10,
+          };
+          if (data.manufactureDate) {
+            batchData.manufactureDate = new Date(data.manufactureDate);
+          }
           const created = await tx.batch.create({
-            data: {
-              batchNumber: normalizedBatchNumber,
-              drugId: data.drugId,
-              supplierId: data.supplierId,
-              unitTypeId: data.unitTypeId,
-              manufactureDate: new Date(data.manufactureDate),
-              expiryDate: new Date(data.expiryDate),
-              unitPrice: data.unitPrice,
-              unitCost: data.unitCost,
-              purchaseDate: new Date(data.purchaseDate),
-              currentQty: data.currentQty ?? 0,
-              lowStockThreshold: data.lowStockThreshold ?? 10,
-            },
+            data: batchData,
           });
 
           if (uniqueLocationIds.length > 0) {
@@ -152,20 +159,23 @@ export class BatchesService {
     } else {
       // Create batch without location mappings
       try {
+        const batchData: any = {
+          batchNumber: normalizedBatchNumber,
+          drugId: data.drugId,
+          supplierId: data.supplierId,
+          unitTypeId: data.unitTypeId,
+          expiryDate: new Date(data.expiryDate),
+          unitPrice: data.unitPrice,
+          unitCost: data.unitCost,
+          purchaseDate: new Date(data.purchaseDate),
+          currentQty: data.currentQty ?? 0,
+          lowStockThreshold: data.lowStockThreshold ?? 10,
+        };
+        if (data.manufactureDate) {
+          batchData.manufactureDate = new Date(data.manufactureDate);
+        }
         return await this.prisma.batch.create({
-          data: {
-            batchNumber: normalizedBatchNumber,
-            drugId: data.drugId,
-            supplierId: data.supplierId,
-            unitTypeId: data.unitTypeId,
-            manufactureDate: new Date(data.manufactureDate),
-            expiryDate: new Date(data.expiryDate),
-            unitPrice: data.unitPrice,
-            unitCost: data.unitCost,
-            purchaseDate: new Date(data.purchaseDate),
-            currentQty: data.currentQty ?? 0,
-            lowStockThreshold: data.lowStockThreshold ?? 10,
-          },
+          data: batchData,
         });
       } catch (error: any) {
         if (error.code === 'P2002' && error.meta?.target?.includes('batchNumber')) {
@@ -287,6 +297,7 @@ export class BatchesService {
               sku: true,
               genericName: true,
               tradeName: true,
+              strength: true,
             },
           },
           supplier: {
@@ -312,6 +323,7 @@ export class BatchesService {
         batch.drug.genericName,
         batch.drug.tradeName,
       ),
+      drugStrength: batch.drug.strength,
       supplierName: batch.supplier.name,
       unitTypeName: batch.unitType?.name,
       drug: undefined, // Remove the drug object
@@ -551,7 +563,7 @@ export class BatchesService {
   })
   async remove(id: number): Promise<Batch> {
     try {
-      // Check if batch has associated transactions or purchase order items
+      // Check if batch exists
       const batchWithRelations = await this.prisma.batch.findUnique({
         where: { id },
         include: {
@@ -565,24 +577,54 @@ export class BatchesService {
         throw new NotFoundException(`Batch with ID ${id} not found`);
       }
 
-      if (batchWithRelations.transactions.length > 0) {
-        throw new ConflictException(
-          'Cannot delete batch with associated transactions',
-        );
+      // Get current user to check if admin
+      const currentUser = this.requestContext.getCurrentUser();
+      const isAdmin = currentUser?.role === UserRole.ADMIN;
+
+      // If not admin, enforce restrictions
+      if (!isAdmin) {
+        if (batchWithRelations.transactions.length > 0) {
+          throw new ConflictException(
+            'Cannot delete batch with associated transactions',
+          );
+        }
+
+        if (batchWithRelations.purchaseOrderItems.length > 0) {
+          throw new ConflictException(
+            'Cannot delete batch with associated purchase order items',
+          );
+        }
+
+        if (batchWithRelations.locationBatches.length > 0) {
+          throw new ConflictException(
+            'Cannot delete batch while it has inventory assigned to locations. Move or clear inventory first.',
+          );
+        }
+      } else {
+        // Admin can force delete - remove related records first
+        // Delete location batches
+        if (batchWithRelations.locationBatches.length > 0) {
+          await this.prisma.locationBatch.deleteMany({
+            where: { batchId: id },
+          });
+        }
+
+        // Delete transactions
+        if (batchWithRelations.transactions.length > 0) {
+          await this.prisma.transaction.deleteMany({
+            where: { batchId: id },
+          });
+        }
+
+        // Delete purchase order items
+        if (batchWithRelations.purchaseOrderItems.length > 0) {
+          await this.prisma.purchaseOrderItem.deleteMany({
+            where: { batchId: id },
+          });
+        }
       }
 
-      if (batchWithRelations.purchaseOrderItems.length > 0) {
-        throw new ConflictException(
-          'Cannot delete batch with associated purchase order items',
-        );
-      }
-
-      if (batchWithRelations.locationBatches.length > 0) {
-        throw new ConflictException(
-          'Cannot delete batch while it has inventory assigned to locations. Move or clear inventory first.',
-        );
-      }
-
+      // Now safe to delete the batch
       return await this.prisma.batch.delete({
         where: { id },
       });

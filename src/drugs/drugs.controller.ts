@@ -30,7 +30,7 @@ export class DrugsController {
   constructor(private readonly drugsService: DrugsService) {}
 
   @Post()
-  @Roles(UserRole.ADMIN, UserRole.MANAGER)
+  @Roles(UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Create a new drug' })
   @ApiResponse({ status: 201, description: 'Drug created successfully.' })
   @ApiResponse({ status: 400, description: 'Bad request.' })
@@ -60,7 +60,7 @@ export class DrugsController {
   }
 
   @Patch(':id')
-  @Roles(UserRole.ADMIN, UserRole.MANAGER)
+  @Roles(UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Update drug by id' })
   @ApiResponse({ status: 200, description: 'Drug updated successfully.' })
   @ApiResponse({ status: 404, description: 'Drug not found.' })

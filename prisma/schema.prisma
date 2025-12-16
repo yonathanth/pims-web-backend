@@ -70,7 +70,7 @@ model Drug {
   genericName        String
   tradeName          String?
   strength           String
-  description        String
+  description        String?
   categoryId         Int
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
@@ -87,7 +87,7 @@ model Batch {
   drugId             Int
   supplierId         Int
   unitTypeId         Int
-  manufactureDate    DateTime
+  manufactureDate    DateTime?
   expiryDate         DateTime
   unitCost           Float
   purchaseDate       DateTime
@@ -175,11 +175,13 @@ model Transaction {
   batchId         Int
   transactionType String
   quantity        Int
+  unitPrice       Float?    // Price at time of transaction
   transactionDate DateTime  @default(now())
   userId          Int?
   notes           String?
   fromLocationId  Int?
   toLocationId    Int?
+  saleId          Int?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
   status          String?
@@ -187,8 +189,20 @@ model Transaction {
   fromLocation    Location? @relation("TransactionFrom", fields: [fromLocationId], references: [id])
   toLocation      Location? @relation("TransactionTo", fields: [toLocationId], references: [id])
   user            User?     @relation(fields: [userId], references: [id])
+  sale            Sale?     @relation(fields: [saleId], references: [id])
 
   @@map("transactions")
+}
+
+model Sale {
+  id          Int           @id @default(autoincrement())
+  status      String        @default("pending")
+  notes       String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  transactions Transaction[]
+
+  @@map("sales")
 }
 
 model AuditLog {
