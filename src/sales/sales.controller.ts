@@ -8,6 +8,7 @@ import {
   UseGuards,
   HttpException,
   HttpStatus,
+  Req,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -21,7 +22,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { UserRole } from '@prisma/client';
-import { ApproveSaleDto, DeclineSaleDto, SalesQueryDto } from './dto';
+import { ApproveSaleDto, DeclineSaleDto, SalesQueryDto, CreateSaleDto } from './dto';
 
 @ApiTags('Sales')
 @Controller('sales')
@@ -61,6 +62,88 @@ export class SalesController {
       throw new HttpException(
         `Failed to get sales: ${error.message}`,
         HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Post()
+  @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
+  @ApiOperation({ summary: 'Create a new grouped sale' })
+  @ApiBody({ type: CreateSaleDto })
+  @ApiResponse({
+    status: 201,
+    description: 'Sale created successfully',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad request - insufficient quantity or invalid data',
+  })
+  async createSale(@Body() createSaleDto: CreateSaleDto, @Req() req: any) {
+    try {
+      const userId = req.user?.userId as number;
+      return await this.salesService.createGroupedSale(createSaleDto, userId);
+    } catch (error) {
+      throw new HttpException(
+        error.message || 'Failed to create sale',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Post('group/:saleId/approve')
+  @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
+  @ApiOperation({ summary: 'Approve an entire sale group' })
+  @ApiParam({ name: 'saleId', description: 'Sale group ID' })
+  @ApiBody({ type: ApproveSaleDto })
+  @ApiResponse({
+    status: 200,
+    description: 'Sale group approved successfully',
+  })
+  async approveSaleGroup(
+    @Param('saleId') saleId: string,
+    @Body() approveSaleDto: ApproveSaleDto,
+    @Req() req: any,
+  ) {
+    try {
+      const userId = req.user?.userId as number;
+      return await this.salesService.approveSaleGroup(
+        parseInt(saleId),
+        approveSaleDto,
+        userId,
+      );
+    } catch (error) {
+      throw new HttpException(
+        error.message || 'Failed to approve sale group',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Post('group/:saleId/decline')
+  @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
+  @ApiOperation({ summary: 'Decline an entire sale group' })
+  @ApiParam({ name: 'saleId', description: 'Sale group ID' })
+  @ApiBody({ type: DeclineSaleDto })
+  @ApiResponse({
+    status: 200,
+    description: 'Sale group declined successfully',
+  })
+  async declineSaleGroup(
+    @Param('saleId') saleId: string,
+    @Body() declineSaleDto: DeclineSaleDto,
+    @Req() req: any,
+  ) {
+    try {
+      const userId = req.user?.userId as number;
+      return await this.salesService.declineSaleGroup(
+        parseInt(saleId),
+        declineSaleDto,
+        userId,
+      );
+    } catch (error) {
+      throw new HttpException(
+        error.message || 'Failed to decline sale group',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }
   }
