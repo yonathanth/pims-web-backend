@@ -9,6 +9,7 @@ import {
   Query,
   UseGuards,
   ParseIntPipe,
+  UseInterceptors,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -31,6 +32,7 @@ import { PurchaseOrder, PurchaseOrderItem } from '@prisma/client';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
+import { IdempotencyInterceptor } from '../common/idempotency.interceptor';
 
 @ApiTags('purchase-orders')
 @ApiBearerAuth('JWT')
@@ -40,6 +42,7 @@ export class PurchaseOrdersController {
   constructor(private readonly purchaseOrdersService: PurchaseOrdersService) {}
 
   @Post()
+  @UseInterceptors(IdempotencyInterceptor)
   @Roles('ADMIN', 'MANAGER')
   @ApiOperation({ summary: 'Create a new purchase order' })
   @ApiResponse({
@@ -48,6 +51,10 @@ export class PurchaseOrdersController {
   })
   @ApiResponse({ status: 400, description: 'Bad request' })
   @ApiResponse({ status: 404, description: 'Supplier not found' })
+  @ApiResponse({
+    status: 409,
+    description: 'Duplicate request detected',
+  })
   create(
     @Body() createPurchaseOrderDto: CreatePurchaseOrderDto,
   ): Promise<PurchaseOrder> {
@@ -55,6 +62,7 @@ export class PurchaseOrdersController {
   }
 
   @Post('with-items')
+  @UseInterceptors(IdempotencyInterceptor)
   @Roles('ADMIN', 'MANAGER')
   @ApiOperation({
     summary: 'Create a new purchase order with items (atomic operation)',
@@ -67,6 +75,10 @@ export class PurchaseOrdersController {
   @ApiResponse({
     status: 404,
     description: 'Supplier, drug, or batch not found',
+  })
+  @ApiResponse({
+    status: 409,
+    description: 'Duplicate request detected',
   })
   createWithItems(
     @Body() createPurchaseOrderWithItemsDto: CreatePurchaseOrderWithItemsDto,

@@ -3,12 +3,12 @@ import {
   Controller,
   Get,
   Post,
-  Patch,
   UseGuards,
   Req,
   Param,
   Query,
   ParseIntPipe,
+  UseInterceptors,
 } from '@nestjs/common';
 import { TransactionsService } from './transactions.service';
 import {
@@ -26,6 +26,7 @@ import {
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
+import { IdempotencyInterceptor } from '../common/idempotency.interceptor';
 
 @ApiTags('transactions')
 @ApiBearerAuth('JWT')
@@ -35,12 +36,17 @@ export class TransactionsController {
   constructor(private readonly transactionsService: TransactionsService) {}
 
   @Post()
+  @UseInterceptors(IdempotencyInterceptor)
   @Roles(UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Create a transaction and adjust batch quantity' })
   @ApiResponse({ status: 201, description: 'Transaction created successfully' })
   @ApiResponse({
     status: 400,
     description: 'Insufficient quantity or bad request',
+  })
+  @ApiResponse({
+    status: 409,
+    description: 'Duplicate request detected',
   })
   create(@Body() dto: CreateTransactionDto, @Req() req: any) {
     const userId = req.user?.userId as number;
@@ -94,37 +100,5 @@ export class TransactionsController {
   })
   async getPendingSales(): Promise<TransactionResponseDto[]> {
     return this.transactionsService.getPendingSales();
-  }
-
-  @Patch(':id/status')
-  @Roles(UserRole.SELLER)
-  @ApiOperation({
-    summary: 'Update transaction status',
-    description:
-      'Seller updates the status of a pending sale transaction (completed or declined)',
-  })
-  @ApiResponse({
-    status: 200,
-    description: 'Transaction status updated successfully',
-    type: TransactionResponseDto,
-  })
-  @ApiResponse({
-    status: 400,
-    description: 'Bad request - invalid status or transaction not pending',
-  })
-  @ApiResponse({
-    status: 404,
-    description: 'Transaction not found',
-  })
-  async updateTransactionStatus(
-    @Param('id', ParseIntPipe) transactionId: number,
-    @Body() body: { status: string; notes?: string },
-  ): Promise<TransactionResponseDto> {
-    await this.transactionsService.updateTransactionStatus(
-      transactionId,
-      body.status,
-      body.notes,
-    );
-    return this.transactionsService.findOne(transactionId);
   }
 }

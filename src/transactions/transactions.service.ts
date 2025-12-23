@@ -47,9 +47,11 @@ export class TransactionsService {
     if (!batch)
       throw new NotFoundException(`Batch with ID ${dto.batchId} not found`);
 
-    // Process all transaction types uniformly - deduct inventory immediately regardless of status
+    // For SALE transactions, don't deduct inventory - only deduct on approval
+    // For other transaction types, deduct inventory immediately
     const sign = this.getQuantitySign(dto.transactionType);
     const delta = sign * dto.quantity;
+    const isSale = dto.transactionType === TransactionType.SALE;
 
     // Check if there's sufficient quantity for negative changes (sales, negative returns)
     if (delta < 0 && batch.currentQty + delta < 0) {
@@ -59,16 +61,19 @@ export class TransactionsService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
-      // Update batch quantity immediately for all transaction types
-      const updatedBatch = await tx.batch.update({
-        where: { id: batch.id },
-        data: { currentQty: { increment: delta } },
-      });
+      // Only update batch quantity for non-sale transactions
+      // Sales will deduct inventory when approved
+      if (!isSale) {
+        const updatedBatch = await tx.batch.update({
+          where: { id: batch.id },
+          data: { currentQty: { increment: delta } },
+        });
 
-      if (updatedBatch.currentQty < 0) {
-        throw new BadRequestException(
-          'Insufficient batch quantity for this transaction',
-        );
+        if (updatedBatch.currentQty < 0) {
+          throw new BadRequestException(
+            'Insufficient batch quantity for this transaction',
+          );
+        }
       }
 
       // Create transaction record with appropriate status
@@ -80,18 +85,18 @@ export class TransactionsService {
           unitPrice: batch.unitPrice,
           userId,
           notes: dto.notes,
-          status:
-            dto.transactionType === TransactionType.SALE
-              ? 'pending'
-              : 'completed',
+          status: isSale ? 'pending' : 'completed',
         },
       });
 
       return created;
     });
 
-    // Evaluate stock notifications after transaction
-    await this.notificationsService.evaluateBatchStock(dto.batchId);
+    // Evaluate stock notifications after transaction (only for non-sale transactions)
+    // Sales will trigger notifications when approved
+    if (!isSale) {
+      await this.notificationsService.evaluateBatchStock(dto.batchId);
+    }
 
     return result;
   }
@@ -318,72 +323,5 @@ export class TransactionsService {
       fromLocation: undefined,
       toLocation: undefined,
     }));
-  }
-
-  async updateTransactionStatus(
-    transactionId: number,
-    status: string,
-    notes?: string,
-  ): Promise<Transaction> {
-    const transaction = await this.prisma.transaction.findUnique({
-      where: { id: transactionId },
-    });
-
-    if (!transaction) {
-      throw new NotFoundException(
-        `Transaction with ID ${transactionId} not found`,
-      );
-    }
-
-    if (transaction.status !== 'pending') {
-      throw new BadRequestException(
-        `Transaction is not pending. Current status: ${transaction.status}`,
-      );
-    }
-
-    if (transaction.transactionType !== TransactionType.SALE) {
-      throw new BadRequestException(
-        'Only sale transactions can be updated by sellers',
-      );
-    }
-
-    if (status === 'completed') {
-      // Complete the sale - just update status (inventory already deducted)
-      return await this.prisma.transaction.update({
-        where: { id: transactionId },
-        data: {
-          status: 'completed',
-          notes: notes
-            ? `${transaction.notes || ''} | ${notes}`
-            : transaction.notes,
-        },
-      });
-    } else if (status === 'declined') {
-      // Decline the sale - restore inventory and update status
-      return await this.prisma.$transaction(async (tx) => {
-        // Restore the inventory
-        await tx.batch.update({
-          where: { id: transaction.batchId },
-          data: { currentQty: { increment: transaction.quantity } },
-        });
-
-        // Update transaction status
-        const updatedTransaction = await tx.transaction.update({
-          where: { id: transactionId },
-          data: {
-            status: 'declined',
-            notes: notes
-              ? `${transaction.notes || ''} | DECLINED: ${notes}`
-              : transaction.notes,
-          },
-        });
-
-        return updatedTransaction;
-      });
-    }
-
-    throw new BadRequestException(
-      'Invalid status. Must be "completed" or "declined"',
-    );
   }
 }

@@ -9,6 +9,7 @@ import {
   HttpException,
   HttpStatus,
   Req,
+  UseInterceptors,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -23,6 +24,7 @@ import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { UserRole } from '@prisma/client';
 import { ApproveSaleDto, DeclineSaleDto, SalesQueryDto, CreateSaleDto } from './dto';
+import { IdempotencyInterceptor } from '../common/idempotency.interceptor';
 
 @ApiTags('Sales')
 @Controller('sales')
@@ -67,6 +69,7 @@ export class SalesController {
   }
 
   @Post()
+  @UseInterceptors(IdempotencyInterceptor)
   @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Create a new grouped sale' })
   @ApiBody({ type: CreateSaleDto })
@@ -77,6 +80,10 @@ export class SalesController {
   @ApiResponse({
     status: 400,
     description: 'Bad request - insufficient quantity or invalid data',
+  })
+  @ApiResponse({
+    status: 409,
+    description: 'Duplicate request detected',
   })
   async createSale(@Body() createSaleDto: CreateSaleDto, @Req() req: any) {
     try {

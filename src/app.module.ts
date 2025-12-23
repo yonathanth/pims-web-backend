@@ -21,6 +21,7 @@ import { DashboardModule } from './dashboard/dashboard.module';
 import { SalesModule } from './sales/sales.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { UnitTypesModule } from './unit-types/unit-types.module';
+import { BackupModule } from './backup/backup.module';
 
 @Module({
   imports: [
@@ -47,6 +48,7 @@ import { UnitTypesModule } from './unit-types/unit-types.module';
     SalesModule,
     AnalyticsModule,
     UnitTypesModule,
+    BackupModule,
   ],
   controllers: [AppController],
   providers: [AppService],

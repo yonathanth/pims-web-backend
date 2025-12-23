@@ -42,10 +42,11 @@ export class DashboardService {
     const now = new Date();
     const oneMonthFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
 
-    // Get total profit (quantity sold * (unit price - unit cost) for all sales transactions)
+    // Get total profit (quantity sold * (unit price - unit cost) for approved sales transactions only)
     const salesTransactions = await this.prisma.transaction.findMany({
       where: {
         transactionType: TransactionType.SALE,
+        status: 'approved',
       },
       include: {
         batch: true,
@@ -53,8 +54,11 @@ export class DashboardService {
     });
 
     const totalProfit = salesTransactions.reduce((sum, transaction) => {
-      const unitPrice = (transaction as any).unitPrice ?? transaction.batch.unitPrice;
-      const profitPerUnit = unitPrice - transaction.batch.unitCost;
+      // Use transaction.unitPrice if available (price at time of transaction),
+      // otherwise fall back to batch.unitPrice (matches analytics calculation)
+      const unitPrice = (transaction as any).unitPrice ?? transaction.batch?.unitPrice ?? 0;
+      const unitCost = transaction.batch?.unitCost || 0;
+      const profitPerUnit = unitPrice - unitCost;
       return sum + transaction.quantity * profitPerUnit;
     }, 0);
 
@@ -152,6 +156,7 @@ export class DashboardService {
         },
         where: {
           transactionType: TransactionType.SALE,
+          status: 'approved',
         },
         orderBy: {
           _sum: {
@@ -275,7 +280,7 @@ export class DashboardService {
       const sixMonthsAgo = new Date();
       sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
 
-      // Get sales data
+      // Get sales data (only approved sales)
       const salesData = await this.prisma.transaction.groupBy({
         by: ['transactionDate'],
         _sum: {
@@ -283,31 +288,15 @@ export class DashboardService {
         },
         where: {
           transactionType: TransactionType.SALE,
+          status: 'approved',
           transactionDate: {
             gte: sixMonthsAgo,
           },
         },
       });
 
-      // Get purchases data
-      const purchasesData = await this.prisma.transaction.groupBy({
-        by: ['transactionDate'],
-        _sum: {
-          quantity: true,
-        },
-        where: {
-          transactionType: 'PURCHASE',
-          transactionDate: {
-            gte: sixMonthsAgo,
-          },
-        },
-      });
-
-      // Group by month
-      const monthlyMap = new Map<
-        string,
-        { sales: number; purchases: number }
-      >();
+      // Group by month (only sales, no purchases)
+      const monthlyMap = new Map<string, { sales: number; purchases: number }>();
 
       salesData.forEach((sale) => {
         const month = sale.transactionDate.toISOString().substring(0, 7);
@@ -317,19 +306,11 @@ export class DashboardService {
         monthlyMap.get(month)!.sales += sale._sum.quantity || 0;
       });
 
-      purchasesData.forEach((purchase) => {
-        const month = purchase.transactionDate.toISOString().substring(0, 7);
-        if (!monthlyMap.has(month)) {
-          monthlyMap.set(month, { sales: 0, purchases: 0 });
-        }
-        monthlyMap.get(month)!.purchases += purchase._sum.quantity || 0;
-      });
-
       const result = Array.from(monthlyMap.entries())
         .map(([month, data]) => ({
           month,
           sales: data.sales,
-          purchases: data.purchases,
+          purchases: 0, // Always 0 since we removed purchases
         }))
         .sort((a, b) => a.month.localeCompare(b.month));
 
@@ -343,7 +324,7 @@ export class DashboardService {
           return {
             month,
             sales: Math.floor(Math.random() * 1000) + 500,
-            purchases: Math.floor(Math.random() * 800) + 300,
+            purchases: 0,
           };
         }).reverse();
       }
@@ -360,7 +341,7 @@ export class DashboardService {
         return {
           month,
           sales: Math.floor(Math.random() * 1000) + 500,
-          purchases: Math.floor(Math.random() * 800) + 300,
+          purchases: 0,
         };
       }).reverse();
     }

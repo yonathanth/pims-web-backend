@@ -7,6 +7,7 @@ import {
   Param,
   Delete,
   Query,
+  UseInterceptors,
 } from '@nestjs/common';
 import { SuppliersService } from './suppliers.service';
 import { UseGuards } from '@nestjs/common';
@@ -26,6 +27,7 @@ import {
   ApiResponse,
   ApiBearerAuth,
 } from '@nestjs/swagger';
+import { IdempotencyInterceptor } from '../common/idempotency.interceptor';
 
 @ApiTags('suppliers')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -35,10 +37,15 @@ export class SuppliersController {
   constructor(private readonly suppliersService: SuppliersService) {}
 
   @Post()
+  @UseInterceptors(IdempotencyInterceptor)
   @Roles(UserRole.ADMIN, UserRole.MANAGER)
   @ApiOperation({ summary: 'Create a new supplier' })
   @ApiResponse({ status: 201, description: 'Supplier created successfully.' })
   @ApiResponse({ status: 400, description: 'Bad request.' })
+  @ApiResponse({
+    status: 409,
+    description: 'Duplicate request detected.',
+  })
   create(@Body() createSupplierDto: CreateSupplierDto) {
     return this.suppliersService.create(createSupplierDto);
   }

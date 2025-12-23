@@ -8,6 +8,7 @@ import {
   Delete,
   Query,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
 import { BatchesService } from './batches.service';
 import { CreateBatchDto, UpdateBatchDto, ListBatchesDto } from './dto';
@@ -21,6 +22,7 @@ import {
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
+import { IdempotencyInterceptor } from '../common/idempotency.interceptor';
 
 @ApiTags('batches')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -30,10 +32,12 @@ export class BatchesController {
   constructor(private readonly batchesService: BatchesService) {}
 
   @Post()
+  @UseInterceptors(IdempotencyInterceptor)
   @Roles(UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Create a new batch' })
   @ApiResponse({ status: 201, description: 'Batch created successfully.' })
   @ApiResponse({ status: 400, description: 'Bad request.' })
+  @ApiResponse({ status: 409, description: 'Duplicate request detected.' })
   create(@Body() dto: CreateBatchDto) {
     return this.batchesService.create(dto);
   }

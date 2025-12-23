@@ -214,13 +214,16 @@ export class AnalyticsService {
   }
 
   private async totalStockValue(): Promise<number> {
-    // Aggregate in DB to avoid loading entire tables into memory
-    const result = await this.prisma.$queryRaw<Array<{ total: number }>>`
-      SELECT COALESCE(SUM(lb.quantity * b."unitCost"), 0) AS total
-      FROM "batches" b
-      JOIN "location_batches" lb ON lb."batchId" = b.id
-    `;
-    return result[0]?.total ?? 0;
+    // Match dashboard calculation: sum of currentQty * unitPrice for all batches
+    const batches = await this.prisma.batch.findMany({
+      select: {
+        currentQty: true,
+        unitPrice: true,
+      },
+    });
+    return batches.reduce((sum, batch) => {
+      return sum + batch.currentQty * batch.unitPrice;
+    }, 0);
   }
 
   private async totalItems(): Promise<number> {
@@ -230,35 +233,35 @@ export class AnalyticsService {
     return result._sum.currentQty || 0;
   }
 
-  private async expiringInDays(
-    days: number,
-    referenceDate?: Date,
-  ): Promise<number> {
-    // If referenceDate is provided, use it; otherwise use current date
-    // This allows calculating expiring items as of a specific date (e.g., end of time filter period)
-    const refDate = referenceDate || new Date();
-    const until = new Date(refDate.getTime() + days * 24 * 60 * 60 * 1000);
+  private async expiringInDays(days: number): Promise<number> {
+    // Match dashboard calculation: count batches expiring within days, with currentQty > 0
+    // Uses current date (not time-filtered)
+    const now = new Date();
+    const until = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
     return await this.prisma.batch.count({
       where: {
         expiryDate: {
-          gte: refDate,
+          gte: now,
           lte: until,
         },
+        currentQty: { gt: 0 }, // Only count batches with remaining stock (matches dashboard)
       },
     });
   }
 
   private async lowStockCount(threshold: number): Promise<number> {
-    // Count drugs whose total quantity across all batches/locations is <= threshold
-    const result = await this.prisma.$queryRaw<Array<{ id: number }>>`
-      SELECT d.id
-      FROM "drugs" d
-      LEFT JOIN "batches" b ON b."drugId" = d.id
-      LEFT JOIN "location_batches" lb ON lb."batchId" = b.id
-      GROUP BY d.id
-      HAVING COALESCE(SUM(lb.quantity), 0) <= ${threshold}
-    `;
-    return result.length;
+    // Match dashboard calculation: count batches where currentQty <= lowStockThreshold
+    // Uses batch.lowStockThreshold instead of a single threshold value
+    // Excludes out of stock batches (currentQty = 0)
+    const lowStockBatches = await this.prisma.batch.findMany({
+      select: {
+        currentQty: true,
+        lowStockThreshold: true,
+      },
+    });
+    return lowStockBatches.filter(
+      (batch) => batch.currentQty > 0 && batch.currentQty <= batch.lowStockThreshold,
+    ).length;
   }
 
   private async delayedPurchaseOrders(): Promise<number> {
@@ -280,24 +283,24 @@ export class AnalyticsService {
     });
   }
 
-  // Count expired batches as of a specific reference date
-  private async expiredBatchesAsOf(asOf: Date): Promise<number> {
+  // Count expired batches (match dashboard: only batches with currentQty > 0)
+  private async expiredBatchesCount(): Promise<number> {
+    const now = new Date();
     return await this.prisma.batch.count({
-      where: { expiryDate: { lt: asOf } },
+      where: {
+        expiryDate: { lt: now },
+        currentQty: { gt: 0 }, // Only count batches with remaining stock (matches dashboard)
+      },
     });
   }
 
   private async outOfStockCount(): Promise<number> {
-    // Count drugs whose total quantity across all batches/locations equals 0
-    const result = await this.prisma.$queryRaw<Array<{ id: number }>>`
-      SELECT d.id
-      FROM "drugs" d
-      LEFT JOIN "batches" b ON b."drugId" = d.id
-      LEFT JOIN "location_batches" lb ON lb."batchId" = b.id
-      GROUP BY d.id
-      HAVING COALESCE(SUM(lb.quantity), 0) = 0
-    `;
-    return result.length;
+    // Count batches with zero quantity (simpler than drug-level aggregation)
+    return await this.prisma.batch.count({
+      where: {
+        currentQty: 0,
+      },
+    });
   }
 
   private async totalSuppliers(): Promise<number> {
@@ -743,6 +746,7 @@ export class AnalyticsService {
     const batches = await this.prisma.batch.findMany({
       where: {
         expiryDate: { lt: new Date() },
+        currentQty: { gt: 0 }, // Only include batches with remaining stock (matches dashboard)
       },
       include: { drug: true, locationBatches: true },
       skip: offset,
@@ -767,15 +771,14 @@ export class AnalyticsService {
     days: number,
     limit: number,
     offset: number,
-    referenceDate?: Date,
   ): Promise<ProductDto[]> {
-    // If referenceDate is provided, use it; otherwise use current date
-    // This allows calculating expiring items as of a specific date (e.g., end of time filter period)
-    const refDate = referenceDate || new Date();
-    const until = new Date(refDate.getTime() + days * 24 * 60 * 60 * 1000);
+    // Uses current date (not time-filtered) to match card calculation
+    const now = new Date();
+    const until = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
     const batches = await this.prisma.batch.findMany({
       where: {
-        expiryDate: { gte: refDate, lte: until },
+        expiryDate: { gte: now, lte: until },
+        currentQty: { gt: 0 }, // Only include batches with remaining stock (matches dashboard)
       },
       include: { drug: true, locationBatches: true },
       skip: offset,
@@ -1053,9 +1056,9 @@ export class AnalyticsService {
 
     const totalStockValueCurrent = await this.totalStockValue();
     const totalItemsCurrent = await this.totalItems();
-    const expiredItemsCurrent = await this.expiredBatchesAsOf(currentEnd);
-    // Use currentEnd as reference to show items expiring within 30 days from the end of the selected period
-    const expiring30Current = await this.expiringInDays(30, currentEnd);
+    // Expired and expiring items use current date (not time-filtered)
+    const expiredItemsCurrent = await this.expiredBatchesCount();
+    const expiring30Current = await this.expiringInDays(30);
     const lowStockCurrent = await this.lowStockCount(
       effectiveLowStockThreshold,
     );
@@ -1132,9 +1135,8 @@ export class AnalyticsService {
     );
     const lowStockTrendUp = lowStockCurrent <= lowStockPrev;
     const outOfStockTrendUp = outOfStockCurrent <= outOfStockPrev;
-    // Compare expired batch counts at previous vs current period ends
-    const prevExpiredItems = await this.expiredBatchesAsOf(prevEnd);
-    const expiredItemsTrendUp = expiredItemsCurrent <= prevExpiredItems;
+    // Expired items are not time-filtered, so trend is always neutral (no comparison)
+    const expiredItemsTrendUp = true;
     const delayedPoTrendUp = delayedPoCurrent === 0;
 
     // Pass time range to distributionByCategory so soldQty respects the time filter
@@ -1156,12 +1158,11 @@ export class AnalyticsService {
 
     const outOfStockProducts = await this.outOfStockProducts(tableLimit, 0);
     const expiredProducts = await this.expiredProducts(tableLimit, 0);
-    // Use currentEnd as reference to show products expiring within 30 days from the end of selected period
+    // Uses current date (not time-filtered) to match card calculation
     const soonToExpireProducts = await this.soonToExpireProducts(
       30,
       tableLimit,
       0,
-      currentEnd,
     );
     const soonToBeOutOfStockProducts = await this.soonToBeOutOfStockProducts(
       effectiveLowStockThreshold,

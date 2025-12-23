@@ -8,6 +8,7 @@ import {
   Delete,
   Query,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
 import { DrugsService } from './drugs.service';
 import { CreateDrugDto, UpdateDrugDto, ListDrugsDto } from './dto';
@@ -21,6 +22,7 @@ import {
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
+import { IdempotencyInterceptor } from '../common/idempotency.interceptor';
 
 @ApiTags('drugs')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -30,13 +32,14 @@ export class DrugsController {
   constructor(private readonly drugsService: DrugsService) {}
 
   @Post()
+  @UseInterceptors(IdempotencyInterceptor)
   @Roles(UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
   @ApiOperation({ summary: 'Create a new drug' })
   @ApiResponse({ status: 201, description: 'Drug created successfully.' })
   @ApiResponse({ status: 400, description: 'Bad request.' })
   @ApiResponse({
     status: 409,
-    description: 'Drug with this SKU already exists.',
+    description: 'Drug with this SKU already exists or duplicate request detected.',
   })
   create(@Body() dto: CreateDrugDto) {
     return this.drugsService.create(dto);

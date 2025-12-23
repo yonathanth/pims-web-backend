@@ -445,6 +445,14 @@ export class BatchesService {
       // Extract locationIds before updating batch (not a Batch model field)
       const { locationIds, ...batchData } = data;
 
+      // Only allow admins to update quantity
+      const currentUser = this.requestContext.getCurrentUser();
+      if (batchData.currentQty !== undefined && currentUser?.role !== 'ADMIN') {
+        throw new BadRequestException(
+          'Only administrators can update batch quantity',
+        );
+      }
+
       // Normalize batchNumber: convert empty string to null/undefined
       if (batchData.batchNumber !== undefined) {
         const normalizedBatchNumber =

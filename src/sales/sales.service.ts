@@ -12,12 +12,14 @@ import {
 } from './dto';
 import { TransactionType } from '../transactions/dto/create-transaction.dto';
 import { AuditLogService } from '../audit-log/audit-log.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class SalesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditLogService: AuditLogService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   async getPendingSales() {
@@ -211,6 +213,7 @@ export class SalesService {
     });
 
     // Then process each line item individually
+    // Only validate availability - don't deduct inventory until approval
     for (const item of dto.items) {
       const batch = await this.prisma.batch.findUnique({
         where: { id: item.batchId },
@@ -220,24 +223,14 @@ export class SalesService {
         throw new NotFoundException(`Batch with ID ${item.batchId} not found`);
       }
 
-      const delta = -item.quantity; // sale reduces stock
-      if (batch.currentQty + delta < 0) {
+      // Validate sufficient quantity available (but don't deduct yet)
+      if (batch.currentQty < item.quantity) {
         throw new BadRequestException(
           `Insufficient quantity for batch ${item.batchId}. Available: ${batch.currentQty}, Requested: ${item.quantity}`,
         );
       }
 
-      const updatedBatch = await this.prisma.batch.update({
-        where: { id: batch.id },
-        data: { currentQty: { increment: delta } },
-      });
-
-      if (updatedBatch.currentQty < 0) {
-        throw new BadRequestException(
-          'Insufficient batch quantity for this transaction',
-        );
-      }
-
+      // Create transaction record without deducting inventory
       await this.prisma.transaction.create({
         data: {
           batchId: item.batchId,
@@ -273,21 +266,49 @@ export class SalesService {
           transactionType: TransactionType.SALE,
           status: 'pending',
         },
+        include: {
+          batch: true,
+        },
       });
 
       if (!transaction) {
         throw new NotFoundException('Pending sale not found');
       }
 
-      // Update transaction status only (stock was already deducted when transaction was created)
-      const updatedTransaction = await this.prisma.transaction.update({
-        where: { id },
-        data: {
-          status: 'approved',
-          notes: approveSaleDto.notes || transaction.notes,
-          updatedAt: new Date(),
-        },
+      // Check if there's sufficient quantity available
+      if (transaction.batch.currentQty < transaction.quantity) {
+        throw new BadRequestException(
+          `Insufficient quantity. Available: ${transaction.batch.currentQty}, Requested: ${transaction.quantity}`,
+        );
+      }
+
+      // Deduct inventory and update transaction status in a transaction
+      const updatedTransaction = await this.prisma.$transaction(async (tx) => {
+        // Deduct inventory
+        const updatedBatch = await tx.batch.update({
+          where: { id: transaction.batchId },
+          data: { currentQty: { decrement: transaction.quantity } },
+        });
+
+        if (updatedBatch.currentQty < 0) {
+          throw new BadRequestException(
+            'Insufficient batch quantity for this transaction',
+          );
+        }
+
+        // Update transaction status
+        return await tx.transaction.update({
+          where: { id },
+          data: {
+            status: 'approved',
+            notes: approveSaleDto.notes || transaction.notes,
+            updatedAt: new Date(),
+          },
+        });
       });
+
+      // Evaluate stock notifications after inventory deduction
+      await this.notificationsService.evaluateBatchStock(transaction.batchId);
 
       return {
         message: 'Sale approved successfully',
@@ -372,15 +393,49 @@ export class SalesService {
     const notesToApply = approveSaleDto.notes;
 
     const updatedSale = await this.prisma.$transaction(async (tx) => {
-      // Update all transactions to approved
-      await tx.transaction.updateMany({
-        where: { saleId },
-        data: {
-          status: 'approved',
-          ...(notesToApply && { notes: notesToApply }),
-          updatedAt: new Date(),
-        },
-      });
+      // First, validate all transactions have sufficient inventory
+      for (const transaction of sale.transactions) {
+        const batch = await tx.batch.findUnique({
+          where: { id: transaction.batchId },
+        });
+
+        if (!batch) {
+          throw new NotFoundException(
+            `Batch with ID ${transaction.batchId} not found`,
+          );
+        }
+
+        if (batch.currentQty < transaction.quantity) {
+          throw new BadRequestException(
+            `Insufficient quantity for batch ${transaction.batchId}. Available: ${batch.currentQty}, Requested: ${transaction.quantity}`,
+          );
+        }
+      }
+
+      // Deduct inventory and update all transactions to approved
+      for (const transaction of sale.transactions) {
+        // Deduct inventory
+        const updatedBatch = await tx.batch.update({
+          where: { id: transaction.batchId },
+          data: { currentQty: { decrement: transaction.quantity } },
+        });
+
+        if (updatedBatch.currentQty < 0) {
+          throw new BadRequestException(
+            `Insufficient batch quantity for transaction ${transaction.id}`,
+          );
+        }
+
+        // Update transaction status
+        await tx.transaction.update({
+          where: { id: transaction.id },
+          data: {
+            status: 'approved',
+            ...(notesToApply && { notes: notesToApply }),
+            updatedAt: new Date(),
+          },
+        });
+      }
 
       // Update sale header
       return tx.sale.update({
@@ -392,6 +447,12 @@ export class SalesService {
         },
       });
     });
+
+    // Evaluate stock notifications for all batches after inventory deduction
+    const batchIds = new Set(sale.transactions.map((t) => t.batchId));
+    for (const batchId of batchIds) {
+      await this.notificationsService.evaluateBatchStock(batchId);
+    }
 
     // Audit log
     this.auditLogService.logAsync({
@@ -444,13 +505,8 @@ export class SalesService {
     }
 
     const updatedSale = await this.prisma.$transaction(async (tx) => {
-      // Restore inventory and mark each transaction as declined
+      // Mark each transaction as declined (no inventory restoration needed since nothing was deducted)
       for (const transaction of pendingTransactions) {
-        await tx.batch.update({
-          where: { id: transaction.batchId },
-          data: { currentQty: { increment: transaction.quantity } },
-        });
-
         await tx.transaction.update({
           where: { id: transaction.id },
           data: {
