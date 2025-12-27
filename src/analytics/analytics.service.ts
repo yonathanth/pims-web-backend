@@ -6,6 +6,7 @@ import {
   KeyMetric,
   CategorySlice,
   MonthlySeriesPoint,
+  YearlySalesPoint,
   SupplierSummary,
   TopPerformerDto,
   ProductDto,
@@ -249,9 +250,9 @@ export class AnalyticsService {
     });
   }
 
-  private async lowStockCount(threshold: number): Promise<number> {
-    // Match dashboard calculation: count batches where currentQty <= lowStockThreshold
-    // Uses batch.lowStockThreshold instead of a single threshold value
+  private async lowStockCount(): Promise<number> {
+    // Match dashboard calculation: count batches where currentQty <= batch.lowStockThreshold
+    // Uses batch.lowStockThreshold (per-batch threshold)
     // Excludes out of stock batches (currentQty = 0)
     const lowStockBatches = await this.prisma.batch.findMany({
       select: {
@@ -309,14 +310,14 @@ export class AnalyticsService {
 
   // Snapshot helpers to support period-over-period trends without historical snapshots
   private async currentDrugQuantities(): Promise<Map<number, number>> {
+    // Use batch.currentQty instead of locationBatches.quantity
     const rows = await this.prisma.$queryRaw<
       Array<{ drugId: number; qty: number }>
     >`
       SELECT d.id as "drugId",
-             COALESCE(CAST(SUM(lb.quantity) AS DOUBLE PRECISION), 0) AS qty
+             COALESCE(CAST(SUM(b."currentQty") AS DOUBLE PRECISION), 0) AS qty
       FROM "drugs" d
       LEFT JOIN "batches" b ON b."drugId" = d.id
-      LEFT JOIN "location_batches" lb ON lb."batchId" = b.id
       GROUP BY d.id
     `;
     return new Map(rows.map((r) => [r.drugId, r.qty || 0]));
@@ -347,18 +348,58 @@ export class AnalyticsService {
   private async estimatePrevCountsAsOf(
     prevEnd: Date,
     currentEnd: Date,
-    threshold: number,
   ): Promise<{ lowStockPrev: number; outOfStockPrev: number }> {
-    const currentQty = await this.currentDrugQuantities();
+    // Estimate previous period counts by rolling back current quantities
+    // Uses batch.lowStockThreshold for each batch (not a single threshold)
+    const batches = await this.prisma.batch.findMany({
+      select: {
+        drugId: true,
+        currentQty: true,
+        lowStockThreshold: true,
+      },
+    });
     const flows = await this.drugFlowsAfter(prevEnd, currentEnd);
+    const currentQty = await this.currentDrugQuantities();
+    
+    // Group batches by drug and calculate previous quantities
+    const drugBatches = new Map<number, typeof batches>();
+    batches.forEach((b) => {
+      if (!drugBatches.has(b.drugId)) {
+        drugBatches.set(b.drugId, []);
+      }
+      drugBatches.get(b.drugId)!.push(b);
+    });
+    
     let low = 0;
     let out = 0;
-    currentQty.forEach((qtyNow, drugId) => {
+    
+    drugBatches.forEach((batchesForDrug, drugId) => {
       const f = flows.get(drugId) || { received: 0, sold: 0 };
-      const prevQty = qtyNow - f.received + f.sold;
-      if (prevQty <= 0) out += 1;
-      else if (prevQty <= threshold) low += 1;
+      const currentDrugQty = currentQty.get(drugId) || 0;
+      const prevDrugQty = currentDrugQty - f.received + f.sold;
+      
+      // Estimate previous quantity per batch proportionally
+      const totalCurrent = batchesForDrug.reduce((sum, b) => sum + b.currentQty, 0);
+      if (totalCurrent === 0) {
+        // If all batches are empty now, check if they were empty before
+        if (prevDrugQty <= 0) out += batchesForDrug.length;
+        return;
+      }
+      
+      batchesForDrug.forEach((batch) => {
+        // Estimate previous quantity for this batch
+        const prevBatchQty = totalCurrent > 0 
+          ? (batch.currentQty / totalCurrent) * prevDrugQty
+          : 0;
+        
+        if (prevBatchQty <= 0) {
+          out += 1;
+        } else if (prevBatchQty <= batch.lowStockThreshold) {
+          low += 1;
+        }
+      });
     });
+    
     return { lowStockPrev: low, outOfStockPrev: out };
   }
 
@@ -411,26 +452,39 @@ export class AnalyticsService {
       },
       include: {
         drug: true,
-        batch: true,
+        batch: {
+          include: {
+            locationBatches: {
+              include: { location: true },
+            },
+          },
+        },
         purchaseOrder: { include: { supplier: true } },
       },
       orderBy: { quantityOrdered: 'desc' },
       take: limit,
     });
-    return items.map((item) => ({
-      genericName: item.drug.tradeName ?? item.drug.genericName,
-      tradeName: item.drug.tradeName || undefined,
-      sku: item.drug.sku || undefined,
-      batchNumber: item.batch?.batchNumber ?? (item.batch?.id.toString() || undefined),
-      expiryDate:
-        item.batch?.expiryDate?.toISOString().split('T')[0] || undefined,
-      quantity: item.quantityReceived,
-      location: undefined,
-      unitPrice: item.unitCost,
-      lastRestock: item.purchaseOrder.createdDate.toISOString().split('T')[0],
-      supplier: item.purchaseOrder.supplier.name,
-      orderedQty: item.quantityOrdered,
-    }));
+    return items.map((item) => {
+      // Get location names from batch if it exists (comma-separated if multiple)
+      const locationNames = item.batch?.locationBatches
+        ?.map((lb) => lb.location.name)
+        .join(', ') || undefined;
+
+      return {
+        genericName: item.drug.tradeName ?? item.drug.genericName,
+        tradeName: item.drug.tradeName || undefined,
+        sku: item.drug.sku || undefined,
+        batchNumber: item.batch?.batchNumber ?? (item.batch?.id.toString() || undefined),
+        expiryDate:
+          item.batch?.expiryDate?.toISOString().split('T')[0] || undefined,
+        quantity: item.quantityReceived,
+        location: locationNames,
+        unitPrice: item.unitCost,
+        lastRestock: item.purchaseOrder.createdDate.toISOString().split('T')[0],
+        supplier: item.purchaseOrder.supplier.name,
+        orderedQty: item.quantityOrdered,
+      };
+    });
   }
 
   private async incompletePurchaseOrdersCount(): Promise<number> {
@@ -466,7 +520,18 @@ export class AnalyticsService {
     const suppliers = await this.prisma.supplier.findMany({
       include: {
         purchaseOrders: {
-          include: { items: { include: { drug: true } } },
+          include: { 
+            items: { 
+              include: { 
+                drug: true,
+                batch: {
+                  select: {
+                    unitCost: true,
+                  },
+                },
+              } 
+            } 
+          },
         },
       },
     });
@@ -478,11 +543,24 @@ export class AnalyticsService {
       const valueSupplied = s.purchaseOrders.reduce(
         (sum, po) =>
           sum +
-          po.items.reduce((s, i) => s + i.quantityReceived * i.unitCost, 0),
+          po.items.reduce((s, i) => {
+            // Prefer batch unitCost (actual purchase cost) if batch exists, otherwise use item unitCost
+            const unitCost = i.batch?.unitCost ?? i.unitCost ?? 0;
+            return s + i.quantityReceived * unitCost;
+          }, 0),
         0,
       );
       const ordersDelivered = s.purchaseOrders.filter(
-        (po) => po.status.toLowerCase() === 'completed',
+        (po) => {
+          // An order is "delivered" only if ALL its items have status "Complete"
+          // We check item status, not order status, since item status is more reliable
+          if (po.items.length === 0) return false;
+          
+          // All items must be "Complete" (case-insensitive, trimmed)
+          return po.items.every(
+            (item) => item.status?.toLowerCase().trim() === 'complete',
+          );
+        },
       ).length;
       const totalOrders = s.purchaseOrders.length;
       const orderCompletionPct =
@@ -529,6 +607,69 @@ export class AnalyticsService {
     return summaries.slice(0, limit).map(({ totalOrders, ...rest }) => rest);
   }
 
+  private async activeSuppliersCount(days: number): Promise<number> {
+    // Count suppliers that have purchase orders in the last N days
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - days);
+    
+    const suppliers = await this.prisma.supplier.findMany({
+      where: {
+        purchaseOrders: {
+          some: {
+            createdDate: { gte: cutoffDate },
+          },
+        },
+      },
+    });
+    return suppliers.length;
+  }
+
+  private async totalPurchasesETB(): Promise<number> {
+    // Sum of all purchase order items: quantityReceived * unitCost
+    // Prefer batch.unitCost (actual purchase cost) if available, otherwise use item.unitCost
+    const items = await this.prisma.purchaseOrderItem.findMany({
+      include: {
+        batch: {
+          select: {
+            unitCost: true,
+          },
+        },
+      },
+    });
+    return items.reduce((sum, item) => {
+      // Prefer batch unitCost (actual purchase cost) if batch exists, otherwise use item unitCost
+      const unitCost = item.batch?.unitCost ?? item.unitCost ?? 0;
+      return sum + item.quantityReceived * unitCost;
+    }, 0);
+  }
+
+  private async onTimeDeliveryRate(): Promise<number> {
+    // Calculate percentage of orders delivered on or before expectedDate
+    const orders = await this.prisma.purchaseOrder.findMany({
+      where: {
+        status: { in: ['Complete', 'Partially Received'], mode: 'insensitive' },
+        expectedDate: { not: null },
+      },
+      select: {
+        expectedDate: true,
+        updatedAt: true,
+        status: true,
+      },
+    });
+
+    if (orders.length === 0) return 0;
+
+    // An order is on-time if it was completed/received on or before expectedDate
+    const onTimeOrders = orders.filter((order) => {
+      if (!order.expectedDate) return false;
+      // Use updatedAt as delivery date (when status changed to completed/received)
+      const deliveryDate = order.updatedAt;
+      return deliveryDate <= order.expectedDate;
+    });
+
+    return (onTimeOrders.length / orders.length) * 100;
+  }
+
   private async topPerformersInRange(
     start: Date,
     end: Date,
@@ -573,55 +714,39 @@ export class AnalyticsService {
     return withUsers.slice(0, limit);
   }
 
-  private async distributionByCategory(
-    start?: Date,
-    end?: Date,
-  ): Promise<CategorySlice[]> {
+  private async distributionByCategory(): Promise<CategorySlice[]> {
+    // Not time-based: shows current stock and all-time sold quantities
     const categories = await this.prisma.category.findMany({
       include: {
         drugs: {
           include: {
-            batches: {
-              include: { locationBatches: true },
-            },
+            batches: true,
           },
         },
       },
     });
     return await Promise.all(
       categories.map(async (c) => {
+        // Use batch.currentQty for consistency with dashboard
         const stockQty = c.drugs.reduce(
           (sum, d) =>
-            sum +
-            d.batches.reduce(
-              (s, b) =>
-                s + b.locationBatches.reduce((lb, l) => lb + l.quantity, 0),
-              0,
-            ),
+            sum + d.batches.reduce((s, b) => s + b.currentQty, 0),
           0,
         );
-        // Calculate soldQty from transactions via batch -> drug -> category relationship
-        // Now filtered by time range if provided
+        // Calculate soldQty from all approved sale transactions (not time-filtered)
         const batchIds = c.drugs.flatMap((d) => d.batches.map((b) => b.id));
         let soldQty = 0;
         if (batchIds.length > 0) {
-          const whereClause: any = {
-            transactionType: {
-              in: [...AnalyticsService.SALE_TYPES],
-              mode: 'insensitive',
-            },
-            status: 'approved',
-            batchId: { in: batchIds },
-          };
-          // Add time filter if provided
-          if (start || end) {
-            whereClause.transactionDate = {};
-            if (start) whereClause.transactionDate.gte = start;
-            if (end) whereClause.transactionDate.lt = end;
-          }
           const soldResult = await this.prisma.transaction.aggregate({
             _sum: { quantity: true },
-            where: whereClause,
+            where: {
+              transactionType: {
+                in: [...AnalyticsService.SALE_TYPES],
+                mode: 'insensitive',
+              },
+              status: 'approved',
+              batchId: { in: batchIds },
+            },
           });
           soldQty = soldResult._sum.quantity || 0;
         }
@@ -666,17 +791,22 @@ export class AnalyticsService {
     
     const points: MonthlySeriesPoint[] = [];
     for (const m of months) {
-      // Stocked: sum of 'receive'/'in' transactions in this month
-      const stockedAgg = await this.prisma.transaction.aggregate({
-        _sum: { quantity: true },
+      // Stocked: sum of currentQty for batches created in this month
+      // This includes batches created manually and from purchase orders
+      // Uses purchaseDate to determine when inventory was stocked
+      const stockedBatches = await this.prisma.batch.findMany({
         where: {
-          transactionType: {
-            in: [...AnalyticsService.RECEIVE_TYPES],
-            mode: 'insensitive',
-          },
-          transactionDate: { gte: m.start, lt: m.end },
+          purchaseDate: { gte: m.start, lt: m.end },
+        },
+        select: {
+          currentQty: true,
         },
       });
+      const stocked = stockedBatches.reduce(
+        (sum, b) => sum + b.currentQty,
+        0,
+      );
+
       // Sold: sum of 'sale' transactions in this month (only approved sales)
       const soldAgg = await this.prisma.transaction.aggregate({
         _sum: { quantity: true },
@@ -691,10 +821,43 @@ export class AnalyticsService {
       });
       points.push({
         month: m.label,
-        stocked: stockedAgg._sum.quantity || 0,
+        stocked,
         sold: soldAgg._sum.quantity || 0,
       });
     }
+    return points;
+  }
+
+  private async yearlySales(): Promise<YearlySalesPoint[]> {
+    // Returns monthly sales for the current year (12 months)
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const points: YearlySalesPoint[] = [];
+
+    for (let month = 0; month < 12; month++) {
+      const monthStart = new Date(currentYear, month, 1);
+      const monthEnd = new Date(currentYear, month + 1, 1);
+      const label = `${monthStart.getFullYear()}-${(monthStart.getMonth() + 1).toString().padStart(2, '0')}`;
+
+      // Sum of approved sale transactions in this month
+      const salesAgg = await this.prisma.transaction.aggregate({
+        _sum: { quantity: true },
+        where: {
+          transactionType: {
+            in: [...AnalyticsService.SALE_TYPES],
+            mode: 'insensitive',
+          },
+          status: 'approved',
+          transactionDate: { gte: monthStart, lt: monthEnd },
+        },
+      });
+
+      points.push({
+        month: label,
+        sales: salesAgg._sum.quantity || 0,
+      });
+    }
+
     return points;
   }
 
@@ -702,38 +865,43 @@ export class AnalyticsService {
     limit: number,
     offset: number,
   ): Promise<ProductDto[]> {
-    const drugs = await this.prisma.drug.findMany({
+    // Use batch.currentQty and show batches with zero quantity (matches card calculation)
+    // Sort by last restock date (most recently out of stock first) to prioritize items that went out of stock recently
+    const batches = await this.prisma.batch.findMany({
+      where: {
+        currentQty: 0,
+      },
       include: {
-        batches: {
-          include: { locationBatches: true },
+        drug: true,
+        supplier: true,
+        locationBatches: {
+          include: { location: true },
         },
       },
+      orderBy: [
+        { purchaseDate: 'desc' }, // Most recently restocked first (most recently out of stock)
+        { drug: { genericName: 'asc' } }, // Secondary sort by drug name for consistency
+      ],
+      skip: offset,
+      take: limit,
     });
-    const outOfStock = drugs.filter(
-      (d) =>
-        d.batches.reduce(
-          (sum, b) =>
-            sum + b.locationBatches.reduce((s, lb) => s + lb.quantity, 0),
-          0,
-        ) === 0,
-    );
-    const paginated = outOfStock.slice(offset, offset + limit);
-    return paginated.map((d) => {
-      const firstBatch =
-        d.batches && d.batches.length > 0 ? d.batches[0] : undefined;
+    return batches.map((b) => {
+      // Get location names (comma-separated if multiple)
+      const locationNames = b.locationBatches
+        .map((lb) => lb.location.name)
+        .join(', ') || undefined;
+
       return {
-        genericName: d.tradeName ?? d.genericName,
-        tradeName: d.tradeName || undefined,
-        sku: d.sku || undefined,
-        batchNumber: firstBatch?.batchNumber ?? (firstBatch?.id ? firstBatch.id.toString() : undefined),
-        expiryDate: firstBatch?.expiryDate
-          ? firstBatch.expiryDate.toISOString().split('T')[0]
-          : undefined,
-        quantity: 0,
-        location: undefined,
-        unitPrice: firstBatch?.unitCost ?? 0,
-        lastRestock: undefined,
-        supplier: undefined,
+        genericName: b.drug.tradeName ?? b.drug.genericName,
+        tradeName: b.drug.tradeName || undefined,
+        sku: b.drug.sku || undefined,
+        batchNumber: b.batchNumber ?? b.id.toString(),
+        expiryDate: b.expiryDate?.toISOString().split('T')[0] || undefined,
+        quantity: b.currentQty, // Use batch.currentQty for consistency
+        location: locationNames,
+        unitPrice: b.unitCost,
+        lastRestock: b.purchaseDate?.toISOString().split('T')[0] || undefined,
+        supplier: b.supplier.name,
         orderedQty: 0,
       };
     });
@@ -743,28 +911,47 @@ export class AnalyticsService {
     limit: number,
     offset: number,
   ): Promise<ProductDto[]> {
+    // Sort by expiry date (most recently expired first) then by quantity (highest first)
+    // This prioritizes recently expired items with high stock value
     const batches = await this.prisma.batch.findMany({
       where: {
         expiryDate: { lt: new Date() },
         currentQty: { gt: 0 }, // Only include batches with remaining stock (matches dashboard)
       },
-      include: { drug: true, locationBatches: true },
+      include: {
+        drug: true,
+        supplier: true,
+        locationBatches: {
+          include: { location: true },
+        },
+      },
+      orderBy: [
+        { expiryDate: 'desc' }, // Most recently expired first (most urgent)
+        { currentQty: 'desc' }, // Then by quantity (highest first - most value at risk)
+      ],
       skip: offset,
       take: limit,
     });
-    return batches.map((b) => ({
-      genericName: b.drug.tradeName ?? b.drug.genericName,
-      tradeName: b.drug.tradeName || undefined,
-      sku: b.drug.sku || undefined,
-      batchNumber: b.batchNumber ?? b.id.toString(),
-      expiryDate: b.expiryDate?.toISOString().split('T')[0] || undefined,
-      quantity: b.locationBatches.reduce((sum, lb) => sum + lb.quantity, 0),
-      location: undefined,
-      unitPrice: b.unitCost,
-      lastRestock: undefined,
-      supplier: undefined,
-      orderedQty: 0,
-    }));
+    return batches.map((b) => {
+      // Get location names (comma-separated if multiple)
+      const locationNames = b.locationBatches
+        .map((lb) => lb.location.name)
+        .join(', ') || undefined;
+
+      return {
+        genericName: b.drug.tradeName ?? b.drug.genericName,
+        tradeName: b.drug.tradeName || undefined,
+        sku: b.drug.sku || undefined,
+        batchNumber: b.batchNumber ?? b.id.toString(),
+        expiryDate: b.expiryDate?.toISOString().split('T')[0] || undefined,
+        quantity: b.currentQty, // Use batch.currentQty for consistency
+        location: locationNames,
+        unitPrice: b.unitCost,
+        lastRestock: b.purchaseDate?.toISOString().split('T')[0] || undefined,
+        supplier: b.supplier.name,
+        orderedQty: 0,
+      };
+    });
   }
 
   private async soonToExpireProducts(
@@ -773,6 +960,7 @@ export class AnalyticsService {
     offset: number,
   ): Promise<ProductDto[]> {
     // Uses current date (not time-filtered) to match card calculation
+    // Sort by expiry date (soonest first) to prioritize items expiring soonest
     const now = new Date();
     const until = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
     const batches = await this.prisma.batch.findMany({
@@ -780,67 +968,102 @@ export class AnalyticsService {
         expiryDate: { gte: now, lte: until },
         currentQty: { gt: 0 }, // Only include batches with remaining stock (matches dashboard)
       },
-      include: { drug: true, locationBatches: true },
+      include: {
+        drug: true,
+        supplier: true,
+        locationBatches: {
+          include: { location: true },
+        },
+      },
+      orderBy: [
+        { expiryDate: 'asc' }, // Soonest expiry first (most urgent)
+        { currentQty: 'desc' }, // Then by quantity (highest first - most value at risk)
+      ],
       skip: offset,
       take: limit,
     });
-    return batches.map((b) => ({
-      genericName: b.drug.tradeName ?? b.drug.genericName,
-      tradeName: b.drug.tradeName || undefined,
-      sku: b.drug.sku || undefined,
-      batchNumber: b.batchNumber ?? b.id.toString(),
-      expiryDate: b.expiryDate?.toISOString().split('T')[0] || undefined,
-      quantity: b.locationBatches.reduce((sum, lb) => sum + lb.quantity, 0),
-      location: undefined,
-      unitPrice: b.unitCost,
-      lastRestock: undefined,
-      supplier: undefined,
-      orderedQty: 0,
-    }));
+    return batches.map((b) => {
+      // Get location names (comma-separated if multiple)
+      const locationNames = b.locationBatches
+        .map((lb) => lb.location.name)
+        .join(', ') || undefined;
+
+      return {
+        genericName: b.drug.tradeName ?? b.drug.genericName,
+        tradeName: b.drug.tradeName || undefined,
+        sku: b.drug.sku || undefined,
+        batchNumber: b.batchNumber ?? b.id.toString(),
+        expiryDate: b.expiryDate?.toISOString().split('T')[0] || undefined,
+        quantity: b.currentQty, // Use batch.currentQty for consistency
+        location: locationNames,
+        unitPrice: b.unitCost,
+        lastRestock: b.purchaseDate?.toISOString().split('T')[0] || undefined,
+        supplier: b.supplier.name,
+        orderedQty: 0,
+      };
+    });
   }
 
   private async soonToBeOutOfStockProducts(
-    thresholdPct: number,
     limit: number,
     offset: number,
   ): Promise<ProductDto[]> {
-    const drugs = await this.prisma.drug.findMany({
+    // Use batch-level filtering with batch.lowStockThreshold to match card logic
+    // Exclude batches with currentQty = 0 (out of stock)
+    // Show batches where currentQty > 0 AND currentQty <= batch.lowStockThreshold
+    const batches = await this.prisma.batch.findMany({
+      where: {
+        currentQty: {
+          gt: 0, // Exclude out of stock batches
+        },
+      },
       include: {
-        batches: {
-          include: { locationBatches: true },
+        drug: true,
+        supplier: true,
+        locationBatches: {
+          include: { location: true },
         },
       },
     });
-    const lowStockDrugs = drugs.filter((d) => {
-      const totalQty = d.batches.reduce(
-        (sum, b) =>
-          sum + b.locationBatches.reduce((s, lb) => s + lb.quantity, 0),
-        0,
-      );
-      return totalQty > 0 && totalQty <= thresholdPct; // > 0 to exclude out of stock, <= threshold for low stock
+
+    // Filter batches where currentQty <= lowStockThreshold (matches card calculation)
+    const lowStockBatches = batches.filter(
+      (b) => b.currentQty > 0 && b.currentQty <= b.lowStockThreshold,
+    );
+
+    // Sort by quantity (lowest first) to prioritize items closest to being out of stock
+    // Secondary sort by how close to threshold (currentQty / lowStockThreshold) for items with same quantity
+    lowStockBatches.sort((a, b) => {
+      // Primary sort: by quantity (ascending - lowest first)
+      if (a.currentQty !== b.currentQty) {
+        return a.currentQty - b.currentQty;
+      }
+      // Secondary sort: by threshold ratio (ascending - closest to threshold first)
+      const ratioA = a.currentQty / a.lowStockThreshold;
+      const ratioB = b.currentQty / b.lowStockThreshold;
+      return ratioA - ratioB;
     });
-    const paginated = lowStockDrugs.slice(offset, offset + limit);
-    return paginated.map((d) => {
-      const totalQty = d.batches.reduce(
-        (sum, b) =>
-          sum + b.locationBatches.reduce((s, lb) => s + lb.quantity, 0),
-        0,
-      );
-      const hasBatch = d.batches && d.batches.length > 0;
+
+    // Paginate
+    const paginated = lowStockBatches.slice(offset, offset + limit);
+
+    return paginated.map((b) => {
+      // Get location names (comma-separated if multiple)
+      const locationNames = b.locationBatches
+        .map((lb) => lb.location.name)
+        .join(', ') || undefined;
+
       return {
-        genericName: d.tradeName ?? d.genericName,
-        tradeName: d.tradeName || undefined,
-        sku: d.sku || undefined,
-        batchNumber: hasBatch ? (d.batches[0].batchNumber ?? d.batches[0].id.toString()) : undefined,
-        expiryDate:
-          hasBatch && d.batches[0].expiryDate
-            ? d.batches[0].expiryDate.toISOString().split('T')[0]
-            : undefined,
-        quantity: totalQty,
-        location: undefined,
-        unitPrice: hasBatch ? d.batches[0].unitCost : 0,
-        lastRestock: undefined,
-        supplier: undefined,
+        genericName: b.drug.tradeName ?? b.drug.genericName,
+        tradeName: b.drug.tradeName || undefined,
+        sku: b.drug.sku || undefined,
+        batchNumber: b.batchNumber ?? b.id.toString(),
+        expiryDate: b.expiryDate?.toISOString().split('T')[0] || undefined,
+        quantity: b.currentQty, // Use batch.currentQty for consistency
+        location: locationNames,
+        unitPrice: b.unitCost,
+        lastRestock: b.purchaseDate?.toISOString().split('T')[0] || undefined,
+        supplier: b.supplier.name,
         orderedQty: 0,
       };
     });
@@ -871,13 +1094,22 @@ export class AnalyticsService {
       paginated.map(async (r) => {
         const batch = await this.prisma.batch.findUnique({
           where: { id: r.batchId },
-          include: { drug: true, locationBatches: true },
+          include: {
+            drug: true,
+            locationBatches: {
+              include: { location: true },
+            },
+            supplier: true,
+          },
         });
         if (!batch) return null;
-        const currentQty = batch.locationBatches.reduce(
-          (sum, lb) => sum + lb.quantity,
-          0,
-        );
+        // Use batch.currentQty instead of locationBatches.quantity
+        const currentQty = batch.currentQty;
+        // Get location names (comma-separated if multiple)
+        const locationNames = batch.locationBatches
+          .map((lb) => lb.location.name)
+          .join(', ') || undefined;
+
         return {
           genericName: batch.drug.tradeName ?? batch.drug.genericName,
           tradeName: batch.drug.tradeName || undefined,
@@ -886,10 +1118,10 @@ export class AnalyticsService {
           expiryDate:
             batch.expiryDate?.toISOString().split('T')[0] || undefined,
           quantity: currentQty,
-          location: undefined,
+          location: locationNames,
           unitPrice: batch.unitCost,
-          lastRestock: undefined,
-          supplier: undefined,
+          lastRestock: batch.purchaseDate?.toISOString().split('T')[0] || undefined,
+          supplier: batch.supplier.name,
           orderedQty: r._sum.quantity || 0,
         };
       }),
@@ -903,16 +1135,18 @@ export class AnalyticsService {
     limit: number,
     offset: number,
   ): Promise<ProductDto[]> {
-    // Get all batches that have some stock
+    // Get all batches that have some stock (use currentQty for consistency)
     const batchesWithStock = await this.prisma.batch.findMany({
       where: {
-        locationBatches: {
-          some: {
-            quantity: { gt: 0 },
-          },
-        },
+        currentQty: { gt: 0 }, // Use currentQty instead of locationBatches
       },
-      include: { drug: true, locationBatches: true },
+      include: {
+        drug: true,
+        locationBatches: {
+          include: { location: true },
+        },
+        supplier: true,
+      },
     });
 
     // Get sales data for the period (only approved sales)
@@ -934,31 +1168,44 @@ export class AnalyticsService {
     );
 
     // Sort batches by sales quantity (ascending), with unsold items first
+    // Include ALL batches with stock, even if they have no sales (soldQty = 0)
+    // Secondary sort by purchase date (oldest first) - if sales are equal, older stock is worse performing
     const sortedBatches = batchesWithStock
       .map((b) => ({
         batch: b,
         soldQty: salesMap.get(b.id) || 0,
       }))
-      .sort((a, b) => a.soldQty - b.soldQty)
+      .sort((a, b) => {
+        // Primary sort: by sales quantity (ascending - lowest first)
+        if (a.soldQty !== b.soldQty) {
+          return a.soldQty - b.soldQty;
+        }
+        // Secondary sort: by purchase date (ascending - oldest first)
+        // If sales are equal, the product that's been in stock longer is worse performing
+        const dateA = a.batch.purchaseDate.getTime();
+        const dateB = b.batch.purchaseDate.getTime();
+        return dateA - dateB;
+      })
       .slice(offset, offset + limit);
 
     return sortedBatches.map(({ batch, soldQty }) => {
-      const currentQty = batch.locationBatches.reduce(
-        (sum, lb) => sum + lb.quantity,
-        0,
-      );
+      // Get location names (comma-separated if multiple)
+      const locationNames = batch.locationBatches
+        .map((lb) => lb.location.name)
+        .join(', ') || undefined;
+
       return {
         genericName: batch.drug.tradeName ?? batch.drug.genericName,
         tradeName: batch.drug.tradeName || undefined,
         sku: batch.drug.sku || undefined,
-        batchNumber: batch.id.toString(),
+        batchNumber: batch.batchNumber ?? batch.id.toString(),
         expiryDate: batch.expiryDate?.toISOString().split('T')[0] || undefined,
-        quantity: currentQty,
-        location: undefined,
+        quantity: batch.currentQty, // Use batch.currentQty for consistency
+        location: locationNames,
         unitPrice: batch.unitCost,
-        lastRestock: undefined,
-        supplier: undefined,
-        orderedQty: soldQty,
+        lastRestock: batch.purchaseDate?.toISOString().split('T')[0] || undefined,
+        supplier: batch.supplier.name,
+        orderedQty: soldQty, // This is the sales quantity (soldQty)
       };
     });
   }
@@ -971,7 +1218,6 @@ export class AnalyticsService {
       startIso,
       endIso,
       dateIso,
-      lowStockThreshold,
       topPerformersSort = TopPerformersSort.Volume,
       topPerformersOrder = SortOrder.Desc,
       topSuppliersSort = TopSuppliersSort.Volume,
@@ -984,20 +1230,6 @@ export class AnalyticsService {
       endIso,
       dateIso,
     );
-
-    // Determine low stock threshold: prefer query override, else DB general config, else 10.
-    let effectiveLowStockThreshold = lowStockThreshold;
-    if (effectiveLowStockThreshold == null) {
-      try {
-        effectiveLowStockThreshold =
-          await this.generalConfigs.getTypedValue<number>(
-            'low_stock_threshold',
-            'number',
-          );
-      } catch {
-        effectiveLowStockThreshold = 10;
-      }
-    }
 
     // Unified limit for table-like sections
     const tableLimit = 10;
@@ -1059,9 +1291,7 @@ export class AnalyticsService {
     // Expired and expiring items use current date (not time-filtered)
     const expiredItemsCurrent = await this.expiredBatchesCount();
     const expiring30Current = await this.expiringInDays(30);
-    const lowStockCurrent = await this.lowStockCount(
-      effectiveLowStockThreshold,
-    );
+    const lowStockCurrent = await this.lowStockCount();
     const delayedPoCurrent = await this.delayedPurchaseOrders();
     const outOfStockCurrent = await this.outOfStockCount();
     const totalSuppliers = await this.totalSuppliers();
@@ -1071,10 +1301,11 @@ export class AnalyticsService {
       currentEnd,
       tableLimit,
     );
+    // Always return top 10 suppliers by volume for Supply tab
     const topSuppliers = await this.topSuppliers(
-      tableLimit,
-      topSuppliersSort,
-      topSuppliersOrder,
+      10,
+      TopSuppliersSort.Volume,
+      SortOrder.Desc,
     );
     const topPerformers = await this.topPerformersInRange(
       currentStart,
@@ -1131,7 +1362,6 @@ export class AnalyticsService {
     const { lowStockPrev, outOfStockPrev } = await this.estimatePrevCountsAsOf(
       prevEnd,
       currentEnd,
-      effectiveLowStockThreshold,
     );
     const lowStockTrendUp = lowStockCurrent <= lowStockPrev;
     const outOfStockTrendUp = outOfStockCurrent <= outOfStockPrev;
@@ -1139,11 +1369,8 @@ export class AnalyticsService {
     const expiredItemsTrendUp = true;
     const delayedPoTrendUp = delayedPoCurrent === 0;
 
-    // Pass time range to distributionByCategory so soldQty respects the time filter
-    const distribution = await this.distributionByCategory(
-      currentStart,
-      currentEnd,
-    );
+    // Distribution by category is not time-based (shows current stock and all-time sold)
+    const distribution = await this.distributionByCategory();
     // Pass time range to monthlyStockedVsSold to respect the time filter
     // Calculate months based on the time range, or default to 12 months if range is too large
     const daysDiff = Math.ceil(
@@ -1165,7 +1392,6 @@ export class AnalyticsService {
       0,
     );
     const soonToBeOutOfStockProducts = await this.soonToBeOutOfStockProducts(
-      effectiveLowStockThreshold,
       tableLimit,
       0,
     );
@@ -1181,6 +1407,21 @@ export class AnalyticsService {
       tableLimit,
       0,
     );
+
+    // Calculate yearly sales for line graph
+    const yearlySales = await this.yearlySales();
+
+    // Calculate supply cards metrics
+    const activeSuppliersCount = await this.activeSuppliersCount(180); // Last 180 days
+    const totalPurchasesETB = await this.totalPurchasesETB();
+    const topSuppliersList = await this.topSuppliers(1, TopSuppliersSort.Volume, SortOrder.Desc)
+    const topSupplierName = topSuppliersList.length > 0
+      ? topSuppliersList[0].name
+      : 'None';
+    const onTimeDeliveryRate = await this.onTimeDeliveryRate();
+    const mostOrderedProductForSupply = mostOrderedProducts.length > 0
+      ? `${mostOrderedProducts[0].tradeName ?? mostOrderedProducts[0].genericName} (${mostOrderedProducts[0].orderedQty})`
+      : 'None';
 
     const metrics: KeyMetric[] = [
       {
@@ -1293,11 +1534,146 @@ export class AnalyticsService {
       },
     ];
 
+    // Sales tab cards
+    const fastestMovingProduct = fastMovingProducts.length > 0
+      ? `${fastMovingProducts[0].tradeName ?? fastMovingProducts[0].genericName} (${fastMovingProducts[0].orderedQty})`
+      : 'None';
+    
+    const topSellingProduct = mostSoldRows.length > 0
+      ? `${mostSoldRows[0].drugName} (${mostSoldRows[0].soldQty})`
+      : 'None';
+    
+    const worstPerformingProduct = slowMovingProducts.length > 0
+      ? `${slowMovingProducts[0].tradeName ?? slowMovingProducts[0].genericName} (${slowMovingProducts[0].orderedQty})`
+      : 'None';
+
+    // Find top-selling category (highest soldQty)
+    const topSellingCategory = distribution.length > 0
+      ? distribution.reduce((top, current) => 
+          current.soldQty > top.soldQty ? current : top
+        )
+      : null;
+    const topCategoryValue = topSellingCategory
+      ? `${topSellingCategory.category} (${topSellingCategory.soldQty})`
+      : 'None';
+
+    // Find month that sold the most from yearly sales data
+    const topSellingMonth = yearlySales.length > 0
+      ? yearlySales.reduce((top, current) => 
+          current.sales > top.sales ? current : top
+        )
+      : null;
+    
+    // Convert YYYY-MM format to month name
+    const getMonthName = (monthStr: string): string => {
+      const monthNames = [
+        'January', 'February', 'March', 'April', 'May', 'June',
+        'July', 'August', 'September', 'October', 'November', 'December'
+      ];
+      const parts = monthStr.split('-');
+      if (parts.length === 2) {
+        const monthIndex = parseInt(parts[1], 10) - 1;
+        if (monthIndex >= 0 && monthIndex < 12) {
+          return monthNames[monthIndex];
+        }
+      }
+      return monthStr; // Fallback to original format if parsing fails
+    };
+    
+    const topMonthValue = topSellingMonth
+      ? `${getMonthName(topSellingMonth.month)} (${topSellingMonth.sales})`
+      : 'None';
+
+    const salesCards: KeyMetric[] = [
+      {
+        label: 'Average sale value',
+        value: `${avgPriceCurrent.toFixed(2)} (+${avgPriceChangePct.toFixed(1)}%)`,
+        trendUp: avgPriceTrendUp,
+      },
+      {
+        label: 'Fastest moving product',
+        value: fastestMovingProduct,
+        trendUp: fastMovingProducts.length > 0 && fastMovingProducts[0].orderedQty > 0,
+      },
+      {
+        label: 'Top-selling product',
+        value: topSellingProduct,
+        trendUp: mostSoldRows.length > 0 && mostSoldRows[0].soldQty > 0,
+      },
+      {
+        label: 'Worst-performing product',
+        value: worstPerformingProduct,
+        trendUp: slowMovingProducts.length > 0 && slowMovingProducts[0].orderedQty === 0,
+      },
+      {
+        label: 'Total Sales Revenue',
+        value: `${revenueCurrent.toFixed(2)} (+${revenueChangePct.toFixed(1)}%)`,
+        trendUp: revenueTrendUp,
+      },
+      {
+        label: 'Total Sales (qty)',
+        value: `${soldCurrent} (+${soldChangePct.toFixed(1)}%)`,
+        trendUp: soldTrendUp,
+      },
+      {
+        label: 'Total Transactions',
+        value: `${transactionsCurrent} (+${transactionsChangePct.toFixed(1)}%)`,
+        trendUp: transactionsTrendUp,
+      },
+      {
+        label: 'Total Profit',
+        value: `${profitCurrent.toFixed(2)} (+${profitChangePct.toFixed(1)}%)`,
+        trendUp: profitTrendUp,
+      },
+      {
+        label: 'Top-selling category',
+        value: topCategoryValue,
+        trendUp: topSellingCategory !== null && topSellingCategory.soldQty > 0,
+      },
+      {
+        label: 'Month that sold the most',
+        value: topMonthValue,
+        trendUp: topSellingMonth !== null && topSellingMonth.sales > 0,
+      },
+    ];
+
+    // Supply tab cards
+    const supplyCards: KeyMetric[] = [
+      {
+        label: 'Active Suppliers',
+        value: `${activeSuppliersCount} (Suppliers used in last 180 days)`,
+        trendUp: activeSuppliersCount > 0,
+      },
+      {
+        label: 'Total Purchases (in ETB)',
+        value: `${totalPurchasesETB.toFixed(2)}`,
+        trendUp: totalPurchasesETB > 0,
+      },
+      {
+        label: 'Top supplier',
+        value: topSupplierName,
+        trendUp: topSuppliersList.length > 0,
+      },
+      {
+        label: 'On-Time Delivery Rate',
+        value: `${onTimeDeliveryRate.toFixed(1)}%`,
+        trendUp: onTimeDeliveryRate >= 80, // Consider 80%+ as good
+      },
+      {
+        label: 'Most ordered product',
+        value: mostOrderedProductForSupply,
+        trendUp: mostOrderedProducts.length > 0 && mostOrderedProducts[0].orderedQty > 0,
+      },
+    ];
+
     return {
       metrics,
       inventoryCards,
+      salesCards,
+      supplyCards,
       distributionByCategory: distribution,
       monthlyStockedVsSold: monthly,
+      yearlySales,
       topSuppliers,
       topPerformers,
       outOfStockProducts,

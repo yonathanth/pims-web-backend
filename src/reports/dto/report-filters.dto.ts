@@ -11,7 +11,7 @@ import { InventoryStatus, PurchaseOrderStatus } from '../types/report.types';
 
 export class ReportFiltersDto {
   @ApiProperty({
-    description: 'Start date for the report (ISO 8601 format)',
+    description: 'Start date for the report. For inventory reports: filters by purchase date (when batch was purchased/received). For sales reports: filters by transaction date. For purchase reports: filters by order creation date. For expiry reports: filters by expiry date. ISO 8601 format',
     example: '2024-01-01',
     required: false,
   })
@@ -20,7 +20,7 @@ export class ReportFiltersDto {
   fromDate?: string;
 
   @ApiProperty({
-    description: 'End date for the report (ISO 8601 format)',
+    description: 'End date for the report. For inventory reports: filters by purchase date (when batch was purchased/received). For sales reports: filters by transaction date. For purchase reports: filters by order creation date. For expiry reports: filters by expiry date. ISO 8601 format',
     example: '2024-12-31',
     required: false,
   })

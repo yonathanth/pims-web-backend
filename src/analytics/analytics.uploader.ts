@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import axios from 'axios';
 import { AnalyticsService } from './analytics.service';
+import { AnalyticsPeriodUploaderService } from './analytics-period-uploader.service';
 import { GeneralConfigsService } from '../general-configs/general-configs.service';
 import {
   AnalyticsResponse,
@@ -44,6 +45,7 @@ export class AnalyticsUploaderService implements OnModuleInit {
 
   constructor(
     private readonly analyticsService: AnalyticsService,
+    private readonly periodUploader: AnalyticsPeriodUploaderService,
     private readonly generalConfigs: GeneralConfigsService,
   ) {}
 
@@ -73,19 +75,101 @@ export class AnalyticsUploaderService implements OnModuleInit {
 
   @Cron(CronExpression.EVERY_HOUR)
   async pushIfChanged() {
-    await this.runUpload(false);
+    // Delegate to period uploader for daily period (new format)
+    this.logger.log('🔄 Old uploader cron triggered - delegating to period uploader for daily sync');
+    const attemptStart = Date.now();
+    this.status.lastAttemptAt = new Date().toISOString();
+    this.running = true;
+    
+    try {
+      const results = await this.periodUploader.syncAllPeriods(false);
+      const dailyResult = results.find((r: any) => r.period === 'daily');
+      
+      this.status.lastDurationMs = Date.now() - attemptStart;
+      
+      if (dailyResult?.outcome === 'uploaded') {
+        this.status.lastSuccessAt = new Date().toISOString();
+        this.status.lastHash = dailyResult.hash || null;
+        this.status.lastResponseCode = 200;
+        this.status.lastError = null;
+        this.logger.log('✅ Period sync completed via old uploader cron');
+      } else if (dailyResult?.outcome === 'skipped-no-change') {
+        this.status.lastSkipReason = 'no-change';
+        this.status.lastHash = dailyResult.hash || null;
+        this.logger.log('⏭️ Period sync skipped (no changes) via old uploader cron');
+      } else {
+        this.status.lastError = dailyResult?.message || 'Period sync failed';
+        this.logger.error(`❌ Period sync failed via old uploader cron: ${this.status.lastError}`);
+      }
+    } catch (error: any) {
+      this.status.lastError = error.message || String(error);
+      this.status.lastDurationMs = Date.now() - attemptStart;
+      this.logger.error(`❌ Period sync failed via old uploader cron: ${this.status.lastError}`);
+    } finally {
+      this.running = false;
+    }
   }
 
   async triggerUpload(force = false): Promise<UploadAttemptResult> {
-    return this.runUpload(force);
+    // Delegate to period uploader for daily period (new format)
+    this.logger.log(`🔄 Manual upload triggered - delegating to period uploader (force=${force})`);
+    const attemptStart = Date.now();
+    this.status.lastAttemptAt = new Date().toISOString();
+    this.running = true;
+    this.status.lastError = null;
+    this.status.lastSkipReason = null;
+    
+    try {
+      const results = await this.periodUploader.syncAllPeriods(force);
+      const dailyResult = results.find((r: any) => r.period === 'daily');
+      
+      this.status.lastDurationMs = Date.now() - attemptStart;
+      
+      if (dailyResult?.outcome === 'uploaded') {
+        this.status.lastSuccessAt = new Date().toISOString();
+        this.status.lastHash = dailyResult.hash || null;
+        this.status.lastResponseCode = 200;
+        return {
+          outcome: dailyResult.outcome as UploadOutcome,
+          message: dailyResult.message || 'Period sync completed',
+        };
+      } else if (dailyResult?.outcome === 'skipped-no-change') {
+        this.status.lastSkipReason = 'no-change';
+        this.status.lastHash = dailyResult.hash || null;
+        return {
+          outcome: 'skipped-no-change',
+          message: dailyResult.message || 'No changes detected',
+        };
+      } else {
+        this.status.lastError = dailyResult?.message || 'Period sync failed';
+        return {
+          outcome: dailyResult?.outcome as UploadOutcome || 'error',
+          message: dailyResult?.message || 'Period sync failed',
+        };
+      }
+    } catch (error: any) {
+      this.status.lastError = error.message || String(error);
+      this.status.lastDurationMs = Date.now() - attemptStart;
+      this.logger.error(`❌ Period sync failed: ${this.status.lastError}`);
+      return {
+        outcome: 'error',
+        message: `Period sync failed: ${error.message}`,
+      };
+    } finally {
+      this.running = false;
+    }
   }
 
   getStatus(): AnalyticsUploadStatusDto {
+    // Get status from period uploader for daily period
+    const periodStatus = this.periodUploader.getStatus();
+    
+    // Merge period uploader status with old format for backward compatibility
     return {
-      running: this.running,
+      running: periodStatus.running || this.running,
       lastAttemptAt: this.status.lastAttemptAt,
       lastSuccessAt: this.status.lastSuccessAt,
-      lastHash: this.status.lastHash,
+      lastHash: periodStatus.lastHashes?.daily || this.status.lastHash,
       lastResponseCode: this.status.lastResponseCode,
       lastDurationMs: this.status.lastDurationMs,
       lastSkipReason: this.status.lastSkipReason,
@@ -326,8 +410,16 @@ Current URL: ${url}`;
       soon_to_expire_products: a.soonToExpireProducts.map(this.mapProduct),
       
       // Sales tab data
+      sales_cards: a.salesCards.map(this.mapKeyMetric),
+      yearly_sales: a.yearlySales.map((y) => ({
+        month: y.month,
+        sales: y.sales,
+      })),
       fast_moving_products: a.fastMovingProducts.map(this.mapProduct),
       slow_moving_products: a.slowMovingProducts.map(this.mapProduct),
+      
+      // Supply tab data
+      supply_cards: a.supplyCards.map(this.mapKeyMetric),
       
       // Note: Removed top_suppliers, top_performers, most_ordered_products
       // as they belong to Supply and Employee tabs, not Sales/Inventory

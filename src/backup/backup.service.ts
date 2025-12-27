@@ -1,158 +1,236 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
+import { HttpException, HttpStatus } from '@nestjs/common';
 
 const execAsync = promisify(exec);
 
 @Injectable()
 export class BackupService {
   private readonly logger = new Logger(BackupService.name);
-  private readonly backupDir = path.join(process.cwd(), 'backups');
+  private readonly backupsDir = path.join(process.cwd(), 'backups');
 
   constructor(private prisma: PrismaService) {
-    // Create backup directory if it doesn't exist
-    if (!fs.existsSync(this.backupDir)) {
-      fs.mkdirSync(this.backupDir, { recursive: true });
+    // Ensure backups directory exists
+    if (!fs.existsSync(this.backupsDir)) {
+      fs.mkdirSync(this.backupsDir, { recursive: true });
     }
   }
 
-  async createBackup(): Promise<{ filePath: string; fileName: string; size: number }> {
-    const dbUrl = process.env.DATABASE_URL;
-    if (!dbUrl) {
-      throw new Error('DATABASE_URL not configured');
+  /**
+   * Parse DATABASE_URL to extract connection details
+   */
+  private parseDatabaseUrl(): {
+    host: string;
+    port: string;
+    database: string;
+    user: string;
+    password: string;
+  } {
+    const databaseUrl = process.env.DATABASE_URL;
+    if (!databaseUrl) {
+      throw new HttpException(
+        'DATABASE_URL environment variable is not set',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
     }
 
-    // Parse database connection details
-    const url = new URL(dbUrl);
-    const dbName = url.pathname.slice(1).split('?')[0];
-    const dbHost = url.hostname;
-    const dbPort = url.port || '5432';
-    const dbUser = url.username;
-    const dbPassword = url.password;
+    // Parse postgresql://user:password@host:port/database?schema=public
+    const urlPattern =
+      /^postgresql:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/([^?]+)(\?.*)?$/;
+    const match = databaseUrl.match(urlPattern);
 
-    // Generate backup filename with timestamp
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
-    const fileName = `pims_backup_${timestamp}.dump`;
-    const filePath = path.join(this.backupDir, fileName);
+    if (!match) {
+      throw new HttpException(
+        'Invalid DATABASE_URL format',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
 
-    this.logger.log(`Creating backup: ${dbName}@${dbHost}:${dbPort}`);
+    return {
+      user: match[1],
+      password: match[2],
+      host: match[3],
+      port: match[4],
+      database: match[5],
+    };
+  }
 
+  /**
+   * Create a database backup using pg_dump
+   */
+  async createBackup(): Promise<{
+    filePath: string;
+    fileName: string;
+    size: number;
+  }> {
     try {
-      // Create backup using pg_dump (custom format)
-      const command = `PGPASSWORD="${dbPassword}" pg_dump -h ${dbHost} -p ${dbPort} -U ${dbUser} -d ${dbName} -F c -f "${filePath}"`;
-      
-      await execAsync(command);
-      
-      const stats = fs.statSync(filePath);
-      const sizeInMB = stats.size / (1024 * 1024);
+      const dbConfig = this.parseDatabaseUrl();
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const fileName = `backup_${timestamp}.dump`;
+      const filePath = path.join(this.backupsDir, fileName);
 
-      this.logger.log(`Backup created: ${fileName} (${sizeInMB.toFixed(2)} MB)`);
+      // Set PGPASSWORD environment variable for pg_dump
+      const env = {
+        ...process.env,
+        PGPASSWORD: dbConfig.password,
+      };
+
+      // Build pg_dump command
+      const command = `pg_dump -h ${dbConfig.host} -p ${dbConfig.port} -U ${dbConfig.user} -d ${dbConfig.database} -F c -f "${filePath}"`;
+
+      this.logger.log(`Creating backup: ${fileName}`);
+      await execAsync(command, { env });
+
+      // Check if file was created
+      if (!fs.existsSync(filePath)) {
+        throw new Error('Backup file was not created');
+      }
+
+      const stats = fs.statSync(filePath);
+      const size = stats.size;
+
+      this.logger.log(`Backup created successfully: ${fileName} (${size} bytes)`);
 
       return {
         filePath,
         fileName,
-        size: stats.size,
+        size,
       };
     } catch (error) {
-      this.logger.error('Backup failed:', error);
-      throw new Error(`Failed to create backup: ${error.message}`);
-    }
-  }
-
-  async checkExistingData(): Promise<{ hasData: boolean; recordCounts: any }> {
-    try {
-      // Check multiple tables to see if database has data
-      const [transactions, drugs, batches, users] = await Promise.all([
-        this.prisma.transaction.count(),
-        this.prisma.drug.count(),
-        this.prisma.batch.count(),
-        this.prisma.user.count(),
-      ]);
-
-      const hasData = transactions > 0 || drugs > 0 || batches > 0 || users > 1; // > 1 because there might be a default admin
-
-      return {
-        hasData,
-        recordCounts: {
-          transactions,
-          drugs,
-          batches,
-          users,
-        },
-      };
-    } catch (error) {
-      this.logger.error('Failed to check existing data:', error);
-      // If we can't check, assume no data to be safe
-      return { hasData: false, recordCounts: {} };
-    }
-  }
-
-  async restoreBackup(filePath: string): Promise<void> {
-    if (!fs.existsSync(filePath)) {
-      throw new Error('Backup file not found');
-    }
-
-    // Check if database has existing data
-    const { hasData } = await this.checkExistingData();
-    if (hasData) {
-      throw new BadRequestException(
-        'Cannot restore backup: Database already contains data. Please use an empty database or contact support.',
+      this.logger.error(`Failed to create backup: ${error.message}`, error.stack);
+      throw new HttpException(
+        `Failed to create backup: ${error.message}`,
+        HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }
-
-    const dbUrl = process.env.DATABASE_URL;
-    if (!dbUrl) {
-      throw new Error('DATABASE_URL not configured');
-    }
-
-    const url = new URL(dbUrl);
-    const dbName = url.pathname.slice(1).split('?')[0];
-    const dbHost = url.hostname;
-    const dbPort = url.port || '5432';
-    const dbUser = url.username;
-    const dbPassword = url.password;
-
-    this.logger.log(`Restoring backup to: ${dbName}@${dbHost}:${dbPort}`);
-
-    try {
-      // Drop and recreate database
-      this.logger.log('Dropping existing database...');
-      try {
-        await execAsync(
-          `PGPASSWORD="${dbPassword}" psql -h ${dbHost} -p ${dbPort} -U ${dbUser} -d postgres -c "DROP DATABASE IF EXISTS ${dbName};"`,
-        );
-      } catch (e) {
-        // Ignore if database doesn't exist
-      }
-
-      this.logger.log('Creating new database...');
-      await execAsync(
-        `PGPASSWORD="${dbPassword}" psql -h ${dbHost} -p ${dbPort} -U ${dbUser} -d postgres -c "CREATE DATABASE ${dbName};"`,
-      );
-
-      this.logger.log('Restoring data from backup...');
-      const restoreCommand = `PGPASSWORD="${dbPassword}" pg_restore -h ${dbHost} -p ${dbPort} -U ${dbUser} -d ${dbName} -c "${filePath}"`;
-      
-      await execAsync(restoreCommand);
-      
-      this.logger.log('Database restored successfully');
-    } catch (error) {
-      this.logger.error('Restore failed:', error);
-      throw new Error(`Failed to restore backup: ${error.message}`);
-    }
   }
 
+  /**
+   * Get backup file buffer
+   */
   getBackupFile(filePath: string): Buffer {
     if (!fs.existsSync(filePath)) {
-      throw new Error('Backup file not found');
+      throw new HttpException(
+        'Backup file not found',
+        HttpStatus.NOT_FOUND,
+      );
     }
     return fs.readFileSync(filePath);
   }
+
+  /**
+   * Restore database from backup file using pg_restore
+   */
+  async restoreBackup(filePath: string): Promise<void> {
+    try {
+      if (!fs.existsSync(filePath)) {
+        throw new HttpException(
+          'Backup file not found',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
+      // Check if database has existing data
+      const hasData = await this.checkExistingData();
+      if (hasData.hasData) {
+        throw new HttpException(
+          'Database has existing data. Cannot restore backup. Please clear the database first.',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
+      const dbConfig = this.parseDatabaseUrl();
+
+      // Set PGPASSWORD environment variable for pg_restore
+      const env = {
+        ...process.env,
+        PGPASSWORD: dbConfig.password,
+      };
+
+      // Build pg_restore command
+      // -c: clean (drop) database objects before recreating
+      // -d: database name
+      const command = `pg_restore -h ${dbConfig.host} -p ${dbConfig.port} -U ${dbConfig.user} -d ${dbConfig.database} -c "${filePath}"`;
+
+      this.logger.log(`Restoring backup from: ${filePath}`);
+      await execAsync(command, { env });
+
+      this.logger.log('Backup restored successfully');
+    } catch (error) {
+      this.logger.error(
+        `Failed to restore backup: ${error.message}`,
+        error.stack,
+      );
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new HttpException(
+        `Failed to restore backup: ${error.message}`,
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  /**
+   * Check if database has existing data
+   */
+  async checkExistingData(): Promise<{
+    hasData: boolean;
+    counts: {
+      drugs: number;
+      batches: number;
+      transactions: number;
+      users: number;
+      suppliers: number;
+      purchaseOrders: number;
+    };
+  }> {
+    try {
+      const [drugs, batches, transactions, users, suppliers, purchaseOrders] =
+        await Promise.all([
+          this.prisma.drug.count(),
+          this.prisma.batch.count(),
+          this.prisma.transaction.count(),
+          this.prisma.user.count(),
+          this.prisma.supplier.count(),
+          this.prisma.purchaseOrder.count(),
+        ]);
+
+      const counts = {
+        drugs,
+        batches,
+        transactions,
+        users,
+        suppliers,
+        purchaseOrders,
+      };
+
+      const hasData =
+        drugs > 0 ||
+        batches > 0 ||
+        transactions > 0 ||
+        users > 1 || // More than 1 because there's always at least one admin user
+        suppliers > 0 ||
+        purchaseOrders > 0;
+
+      return {
+        hasData,
+        counts,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to check existing data: ${error.message}`,
+        error.stack,
+      );
+      throw new HttpException(
+        `Failed to check existing data: ${error.message}`,
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
 }
-
-
-
 

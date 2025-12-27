@@ -19,6 +19,7 @@ import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { AnalyticsService } from './analytics.service';
 import { AnalyticsUploaderService } from './analytics.uploader';
+import { AnalyticsPeriodUploaderService } from './analytics-period-uploader.service';
 import {
   AnalyticsUploadStatusDto,
   TriggerUploadResponseDto,
@@ -33,6 +34,7 @@ export class AnalyticsController {
   constructor(
     private readonly analyticsService: AnalyticsService,
     private readonly analyticsUploader: AnalyticsUploaderService,
+    private readonly periodUploader: AnalyticsPeriodUploaderService,
   ) {}
 
   @Get()
@@ -85,5 +87,42 @@ export class AnalyticsController {
       message: result.message,
       status: this.analyticsUploader.getStatus(),
     };
+  }
+
+  @Post('sync/trigger')
+  // No @Roles decorator - allow all authenticated users
+  @ApiOperation({
+    summary: 'Manually trigger period-based sync (all roles allowed)',
+    description:
+      'Forces the period sync to run immediately for all periods (daily, weekly, monthly, yearly). Pass force=true to bypass hash deduplication.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Period sync results',
+  })
+  async triggerPeriodSync(
+    @Query('force', new DefaultValuePipe(false), ParseBoolPipe) force: boolean,
+  ) {
+    console.log(`🔄 Manual period sync triggered (force=${force})`);
+    const results = await this.periodUploader.syncAllPeriods(force);
+    console.log(`✅ Period sync completed:`, results);
+    return {
+      results,
+      status: this.periodUploader.getStatus(),
+    };
+  }
+
+  @Get('sync/status')
+  // No @Roles decorator - allow all authenticated users
+  @ApiOperation({
+    summary: 'Get period-based sync status',
+    description: 'Returns the current status of the period sync service',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Sync status retrieved successfully',
+  })
+  getPeriodSyncStatus() {
+    return this.periodUploader.getStatus();
   }
 }

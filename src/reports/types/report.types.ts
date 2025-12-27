@@ -23,7 +23,6 @@ export enum PurchaseOrderStatus {
   PARTIALLY_COMPLETED = 'partially_completed',
   CANCELLED = 'cancelled',
 }
-
 export enum TransactionStatus {
   ALL_STATUS = 'all_status',
   APPROVED = 'approved',

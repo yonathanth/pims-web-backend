@@ -46,10 +46,6 @@ export class AnalyticsQueryDto {
   @IsNumber()
   rangeDays?: number;
 
-  @IsOptional()
-  @IsNumber()
-  lowStockThreshold?: number;
-
   // Sorting options
   @IsOptional()
   @IsEnum(TopPerformersSort)
@@ -86,6 +82,11 @@ export class MonthlySeriesPoint {
   sold: number;
 }
 
+export class YearlySalesPoint {
+  month: string;
+  sales: number;
+}
+
 export class SupplierSummary {
   id: number;
   name: string;
@@ -120,8 +121,11 @@ export class ProductDto {
 export class AnalyticsResponse {
   metrics: KeyMetric[];
   inventoryCards: KeyMetric[];
+  salesCards: KeyMetric[];
+  supplyCards: KeyMetric[];
   distributionByCategory: CategorySlice[];
   monthlyStockedVsSold: MonthlySeriesPoint[];
+  yearlySales: YearlySalesPoint[];
   topSuppliers: SupplierSummary[];
   topPerformers: TopPerformerDto[];
   outOfStockProducts: ProductDto[];

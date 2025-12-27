@@ -23,7 +23,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { UserRole } from '@prisma/client';
-import { ApproveSaleDto, DeclineSaleDto, SalesQueryDto, CreateSaleDto } from './dto';
+import { ApproveSaleDto, DeclineSaleDto, SalesQueryDto, CreateSaleDto, ProductSalesQueryDto } from './dto';
 import { IdempotencyInterceptor } from '../common/idempotency.interceptor';
 
 @ApiTags('Sales')
@@ -196,6 +196,24 @@ export class SalesController {
     } catch (error) {
       throw new HttpException(
         `Failed to decline sale: ${error.message}`,
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Get('products')
+  @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
+  @ApiOperation({ summary: 'Get product sales with pagination and period filtering' })
+  @ApiResponse({
+    status: 200,
+    description: 'Product sales retrieved successfully',
+  })
+  async getProductSales(@Query() query: ProductSalesQueryDto) {
+    try {
+      return await this.salesService.getProductSales(query);
+    } catch (error) {
+      throw new HttpException(
+        `Failed to get product sales: ${error.message}`,
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }

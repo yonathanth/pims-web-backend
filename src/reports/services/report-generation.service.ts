@@ -80,9 +80,73 @@ export class ReportGenerationService {
         where: whereClause,
       });
 
+      // Calculate summary metrics directly from database (not from limited reportData)
+      const now = new Date();
+      const thirtyDaysFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+      
+      // Expired count: only batches with currentQty > 0 (matches dashboard/analytics)
+      const expiredCount = await this.prisma.batch.count({
+        where: {
+          ...whereClause,
+          expiryDate: { lt: now },
+          currentQty: { gt: 0 },
+        },
+      });
+
+      // Expiring soon count: batches expiring within 30 days with currentQty > 0
+      const expiringSoonCount = await this.prisma.batch.count({
+        where: {
+          ...whereClause,
+          expiryDate: { gte: now, lte: thirtyDaysFromNow },
+          currentQty: { gt: 0 },
+        },
+      });
+
+      // Low stock count: batches where currentQty > 0 AND currentQty <= lowStockThreshold
+      const lowStockBatches = await this.prisma.batch.findMany({
+        where: whereClause,
+        select: {
+          currentQty: true,
+          lowStockThreshold: true,
+        },
+      });
+      const lowStockCount = lowStockBatches.filter(
+        (b) => b.currentQty > 0 && b.currentQty <= b.lowStockThreshold,
+      ).length;
+
+      // Out of stock count: batches with currentQty = 0
+      const outOfStockCount = await this.prisma.batch.count({
+        where: {
+          ...whereClause,
+          currentQty: 0,
+        },
+      });
+
+      // Total quantity and value from all matching batches
+      const allBatches = await this.prisma.batch.findMany({
+        where: whereClause,
+        select: {
+          currentQty: true,
+          unitPrice: true,
+        },
+      });
+      const totalQuantity = allBatches.reduce((sum, b) => sum + b.currentQty, 0);
+      const totalValue = allBatches.reduce(
+        (sum, b) => sum + b.currentQty * b.unitPrice,
+        0,
+      );
+
       const summary = this.calculateInventorySummaryWithTotal(
         reportData,
         totalCount,
+        {
+          expiredCount,
+          expiringSoonCount,
+          lowStockCount,
+          outOfStockCount,
+          totalQuantity,
+          totalValue,
+        },
       );
 
       console.log('Generate Inventory Report Preview - Final report data:', {
@@ -175,7 +239,70 @@ export class ReportGenerationService {
         ),
       }));
 
-      const summary = this.calculateInventorySummary(reportData);
+      // Calculate summary metrics directly from database (not from reportData)
+      const now = new Date();
+      const thirtyDaysFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+      
+      // Expired count: only batches with currentQty > 0 (matches dashboard/analytics)
+      const expiredCount = await this.prisma.batch.count({
+        where: {
+          ...whereClause,
+          expiryDate: { lt: now },
+          currentQty: { gt: 0 },
+        },
+      });
+
+      // Expiring soon count: batches expiring within 30 days with currentQty > 0
+      const expiringSoonCount = await this.prisma.batch.count({
+        where: {
+          ...whereClause,
+          expiryDate: { gte: now, lte: thirtyDaysFromNow },
+          currentQty: { gt: 0 },
+        },
+      });
+
+      // Low stock count: batches where currentQty > 0 AND currentQty <= lowStockThreshold
+      const lowStockBatches = await this.prisma.batch.findMany({
+        where: whereClause,
+        select: {
+          currentQty: true,
+          lowStockThreshold: true,
+        },
+      });
+      const lowStockCount = lowStockBatches.filter(
+        (b) => b.currentQty > 0 && b.currentQty <= b.lowStockThreshold,
+      ).length;
+
+      // Out of stock count: batches with currentQty = 0
+      const outOfStockCount = await this.prisma.batch.count({
+        where: {
+          ...whereClause,
+          currentQty: 0,
+        },
+      });
+
+      // Total quantity and value from all matching batches
+      const allBatches = await this.prisma.batch.findMany({
+        where: whereClause,
+        select: {
+          currentQty: true,
+          unitPrice: true,
+        },
+      });
+      const totalQuantity = allBatches.reduce((sum, b) => sum + b.currentQty, 0);
+      const totalValue = allBatches.reduce(
+        (sum, b) => sum + b.currentQty * b.unitPrice,
+        0,
+      );
+
+      const summary = this.calculateInventorySummary(reportData, {
+        expiredCount,
+        expiringSoonCount,
+        lowStockCount,
+        outOfStockCount,
+        totalQuantity,
+        totalValue,
+      });
 
       console.log('Generate Inventory Report - Final report data:', {
         reportDataLength: reportData.length,
@@ -245,31 +372,75 @@ export class ReportGenerationService {
         data.length,
       );
 
-      const reportData = data.map((transaction) => ({
-        id: transaction.id,
-        transactionDate: transaction.transactionDate
-          .toISOString()
-          .split('T')[0],
-        sku: transaction.batch.drug.sku,
-        drugName: transaction.batch.drug.tradeName
-          ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
-          : transaction.batch.drug.genericName,
-        quantitySold: transaction.quantity,
-        unitPrice: transaction.unitPrice ?? transaction.batch.unitPrice,
-        totalPrice: transaction.quantity * (transaction.unitPrice ?? transaction.batch.unitPrice),
-        user: transaction.user?.fullName || 'Unknown User',
-        category: transaction.batch.drug.category.name,
-        status: transaction.status || 'pending', // Add status with fallback
-      }));
+      const reportData = data.map((transaction) => {
+        // Match analytics calculation: use transaction.unitPrice if available, else batch.unitPrice
+        const unitPrice = transaction.unitPrice ?? transaction.batch.unitPrice ?? 0;
+        const unitCost = transaction.batch.unitCost || 0;
+        const totalPrice = transaction.quantity * unitPrice;
+        // Match analytics profit calculation: (unitPrice - unitCost) * quantity
+        const profit = transaction.quantity * (unitPrice - unitCost);
+        
+        return {
+          id: transaction.id,
+          transactionDate: transaction.transactionDate
+            .toISOString()
+            .split('T')[0],
+          sku: transaction.batch.drug.sku,
+          drugName: transaction.batch.drug.tradeName
+            ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
+            : transaction.batch.drug.genericName,
+          quantitySold: transaction.quantity,
+          unitPrice,
+          totalPrice,
+          profit, // Add profit calculation to match analytics
+          user: transaction.user?.fullName || 'Unknown User',
+          category: transaction.batch.drug.category.name,
+          status: transaction.status || 'pending', // Add status with fallback
+        };
+      });
 
       // Get total count for summary
       const totalCount = await this.prisma.transaction.count({
         where: whereClause,
       });
 
+      // Calculate summary metrics directly from database (not from limited reportData)
+      // Exclude declined transactions from financial calculations
+      const allTransactions = await this.prisma.transaction.findMany({
+        where: whereClause,
+        include: { batch: true },
+      });
+      
+      // Filter out declined transactions for financial calculations
+      const approvedTransactions = allTransactions.filter(
+        (t) => t.status?.toLowerCase() !== 'declined',
+      );
+      
+      const totalQuantitySold = approvedTransactions.reduce(
+        (sum, t) => sum + t.quantity,
+        0,
+      );
+      const totalRevenue = approvedTransactions.reduce(
+        (sum, t) => sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
+        0,
+      );
+      const totalProfit = approvedTransactions.reduce(
+        (sum, t) => {
+          const unitPrice = (t as any).unitPrice ?? t.batch?.unitPrice ?? 0;
+          const unitCost = t.batch?.unitCost || 0;
+          return sum + t.quantity * (unitPrice - unitCost);
+        },
+        0,
+      );
+
       const summary = this.calculateSalesSummaryWithTotal(
         reportData,
         totalCount,
+        {
+          totalQuantitySold,
+          totalRevenue,
+          totalProfit,
+        },
       );
 
       console.log('Generate Sales Report Preview - Final report data:', {
@@ -289,6 +460,7 @@ export class ReportGenerationService {
           { key: 'quantitySold', header: 'Quantity Sold' },
           { key: 'unitPrice', header: 'Unit Price' },
           { key: 'totalPrice', header: 'Total Price' },
+          { key: 'profit', header: 'Profit' },
           { key: 'user', header: 'User' },
           { key: 'category', header: 'Category' },
           { key: 'status', header: 'Status' },
@@ -326,22 +498,65 @@ export class ReportGenerationService {
       },
     });
 
-    const reportData = data.map((transaction) => ({
-      id: transaction.id,
-      transactionDate: transaction.transactionDate.toISOString().split('T')[0],
-      sku: transaction.batch.drug.sku,
-      drugName: transaction.batch.drug.tradeName
-        ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
-        : transaction.batch.drug.genericName,
-      quantitySold: transaction.quantity,
-      unitPrice: transaction.unitPrice ?? transaction.batch.unitPrice,
-      totalPrice: transaction.quantity * (transaction.unitPrice ?? transaction.batch.unitPrice),
-      user: transaction.user?.fullName || 'Unknown User',
-      category: transaction.batch.drug.category.name,
-      status: transaction.status || 'pending', // Add status with fallback
-    }));
+    const reportData = data.map((transaction) => {
+      // Match analytics calculation: use transaction.unitPrice if available, else batch.unitPrice
+      const unitPrice = transaction.unitPrice ?? transaction.batch.unitPrice ?? 0;
+      const unitCost = transaction.batch.unitCost || 0;
+      const totalPrice = transaction.quantity * unitPrice;
+      // Match analytics profit calculation: (unitPrice - unitCost) * quantity
+      const profit = transaction.quantity * (unitPrice - unitCost);
+      
+      return {
+        id: transaction.id,
+        transactionDate: transaction.transactionDate.toISOString().split('T')[0],
+        sku: transaction.batch.drug.sku,
+        drugName: transaction.batch.drug.tradeName
+          ? `${transaction.batch.drug.genericName} (${transaction.batch.drug.tradeName})`
+          : transaction.batch.drug.genericName,
+        quantitySold: transaction.quantity,
+        unitPrice,
+        totalPrice,
+        profit, // Add profit calculation to match analytics
+        user: transaction.user?.fullName || 'Unknown User',
+        category: transaction.batch.drug.category.name,
+        status: transaction.status || 'pending', // Add status with fallback
+      };
+    });
 
-    const summary = this.calculateSalesSummary(reportData);
+    // Calculate summary metrics directly from database (not from reportData)
+    // Exclude declined transactions from financial calculations
+    const allTransactions = await this.prisma.transaction.findMany({
+      where: whereClause,
+      include: { batch: true },
+    });
+    
+    // Filter out declined transactions for financial calculations
+    const approvedTransactions = allTransactions.filter(
+      (t) => t.status?.toLowerCase() !== 'declined',
+    );
+    
+    const totalQuantitySold = approvedTransactions.reduce(
+      (sum, t) => sum + t.quantity,
+      0,
+    );
+    const totalRevenue = approvedTransactions.reduce(
+      (sum, t) => sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
+      0,
+    );
+    const totalProfit = approvedTransactions.reduce(
+      (sum, t) => {
+        const unitPrice = (t as any).unitPrice ?? t.batch?.unitPrice ?? 0;
+        const unitCost = t.batch?.unitCost || 0;
+        return sum + t.quantity * (unitPrice - unitCost);
+      },
+      0,
+    );
+
+    const summary = this.calculateSalesSummary(reportData, {
+      totalQuantitySold,
+      totalRevenue,
+      totalProfit,
+    });
 
     return {
       reportType: 'Sales Report',
@@ -418,7 +633,8 @@ export class ReportGenerationService {
             'No Location',
           supplier: batch.supplier.name,
           unitCost: batch.unitCost,
-          totalValue: batch.currentQty * batch.unitCost,
+          // Match analytics: use unitPrice for totalValue calculation
+          totalValue: batch.currentQty * batch.unitPrice,
           category: batch.drug.category.name,
         };
       });
@@ -428,10 +644,44 @@ export class ReportGenerationService {
         where: whereClause,
       });
 
+      // Calculate summary metrics directly from database (not from limited reportData)
+      const now = new Date();
+      const allBatches = await this.prisma.batch.findMany({
+        where: whereClause,
+        select: {
+          currentQty: true,
+          unitPrice: true,
+          expiryDate: true,
+        },
+      });
+      
+      const totalQuantity = allBatches.reduce((sum, b) => sum + b.currentQty, 0);
+      const totalValue = allBatches.reduce(
+        (sum, b) => sum + b.currentQty * b.unitPrice,
+        0,
+      );
+      const expiredCount = allBatches.filter(
+        (b) => b.expiryDate < now,
+      ).length;
+      const expiringSoonCount = allBatches.filter(
+        (b) => {
+          const daysUntilExpiry = Math.ceil(
+            (b.expiryDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24),
+          );
+          return daysUntilExpiry <= daysThreshold && daysUntilExpiry >= 0;
+        },
+      ).length;
+
       const summary = this.calculateExpirySummaryWithTotal(
         reportData,
         totalCount,
         daysThreshold,
+        {
+          totalQuantity,
+          totalValue,
+          expiredCount,
+          expiringSoonCount,
+        },
       );
 
       return {
@@ -511,12 +761,46 @@ export class ReportGenerationService {
           'No Location',
         supplier: batch.supplier.name,
         unitCost: batch.unitCost,
-        totalValue: batch.currentQty * batch.unitCost,
+        // Match analytics: use unitPrice for totalValue calculation
+        totalValue: batch.currentQty * batch.unitPrice,
         category: batch.drug.category.name,
       };
     });
 
-    const summary = this.calculateExpirySummary(reportData, daysThreshold);
+    // Calculate summary metrics directly from database (not from reportData)
+    const now = new Date();
+    const allBatches = await this.prisma.batch.findMany({
+      where: whereClause,
+      select: {
+        currentQty: true,
+        unitPrice: true,
+        expiryDate: true,
+      },
+    });
+    
+    const totalQuantity = allBatches.reduce((sum, b) => sum + b.currentQty, 0);
+    const totalValue = allBatches.reduce(
+      (sum, b) => sum + b.currentQty * b.unitPrice,
+      0,
+    );
+    const expiredCount = allBatches.filter(
+      (b) => b.expiryDate < now,
+    ).length;
+    const expiringSoonCount = allBatches.filter(
+      (b) => {
+        const daysUntilExpiry = Math.ceil(
+          (b.expiryDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24),
+        );
+        return daysUntilExpiry <= daysThreshold && daysUntilExpiry >= 0;
+      },
+    ).length;
+
+    const summary = this.calculateExpirySummary(reportData, daysThreshold, {
+      totalQuantity,
+      totalValue,
+      expiredCount,
+      expiringSoonCount,
+    });
 
     return {
       reportType: 'Expiry Report',
@@ -589,6 +873,9 @@ export class ReportGenerationService {
           item.quantityOrdered > 0
             ? (item.quantityReceived / item.quantityOrdered) * 100
             : 0;
+        
+        // Match analytics: prefer batch.unitCost if available, otherwise use item.unitCost
+        const unitCost = item.batch?.unitCost ?? item.unitCost ?? 0;
 
         return {
           id: item.id,
@@ -605,8 +892,8 @@ export class ReportGenerationService {
           category: item.drug.category.name,
           quantityOrdered: item.quantityOrdered,
           quantityReceived: item.quantityReceived,
-          unitCost: item.unitCost,
-          totalCost: item.quantityOrdered * item.unitCost,
+          unitCost,
+          totalCost: item.quantityOrdered * unitCost,
           status: item.status,
           fulfillmentRate: Math.round(fulfillmentRate * 100) / 100,
         };
@@ -617,9 +904,37 @@ export class ReportGenerationService {
         where: whereClause,
       });
 
+      // Calculate summary metrics directly from database (not from limited reportData)
+      const allItems = await this.prisma.purchaseOrderItem.findMany({
+        where: whereClause,
+        include: { batch: true },
+      });
+      
+      const totalQuantityOrdered = allItems.reduce(
+        (sum, item) => sum + item.quantityOrdered,
+        0,
+      );
+      const totalQuantityReceived = allItems.reduce(
+        (sum, item) => sum + item.quantityReceived,
+        0,
+      );
+      // Use batch.unitCost if available, otherwise use item.unitCost
+      const totalValue = allItems.reduce(
+        (sum, item) => {
+          const unitCost = item.batch?.unitCost ?? item.unitCost ?? 0;
+          return sum + item.quantityOrdered * unitCost;
+        },
+        0,
+      );
+
       const summary = this.calculatePurchaseSummaryWithTotal(
         reportData,
         totalCount,
+        {
+          totalQuantityOrdered,
+          totalQuantityReceived,
+          totalValue,
+        },
       );
 
       console.log('Generate Purchase Report Preview - Final report data:', {
@@ -691,6 +1006,9 @@ export class ReportGenerationService {
         item.quantityOrdered > 0
           ? (item.quantityReceived / item.quantityOrdered) * 100
           : 0;
+      
+      // Match analytics: prefer batch.unitCost if available, otherwise use item.unitCost
+      const unitCost = item.batch?.unitCost ?? item.unitCost ?? 0;
 
       return {
         id: item.id,
@@ -704,14 +1022,41 @@ export class ReportGenerationService {
         category: item.drug.category.name,
         quantityOrdered: item.quantityOrdered,
         quantityReceived: item.quantityReceived,
-        unitCost: item.unitCost,
-        totalCost: item.quantityOrdered * item.unitCost,
+        unitCost,
+        totalCost: item.quantityOrdered * unitCost,
         status: item.status,
         fulfillmentRate: Math.round(fulfillmentRate * 100) / 100,
       };
     });
 
-    const summary = this.calculatePurchaseSummary(reportData);
+    // Calculate summary metrics directly from database (not from reportData)
+    const allItems = await this.prisma.purchaseOrderItem.findMany({
+      where: whereClause,
+      include: { batch: true },
+    });
+    
+    const totalQuantityOrdered = allItems.reduce(
+      (sum, item) => sum + item.quantityOrdered,
+      0,
+    );
+    const totalQuantityReceived = allItems.reduce(
+      (sum, item) => sum + item.quantityReceived,
+      0,
+    );
+    // Use batch.unitCost if available, otherwise use item.unitCost
+    const totalValue = allItems.reduce(
+      (sum, item) => {
+        const unitCost = item.batch?.unitCost ?? item.unitCost ?? 0;
+        return sum + item.quantityOrdered * unitCost;
+      },
+      0,
+    );
+
+    const summary = this.calculatePurchaseSummary(reportData, {
+      totalQuantityOrdered,
+      totalQuantityReceived,
+      totalValue,
+    });
 
     return {
       reportType: 'Purchase Report',
@@ -740,6 +1085,8 @@ export class ReportGenerationService {
   private buildInventoryWhereClause(filters: ReportFilters) {
     const where: any = {};
 
+    // Date filter applies to purchaseDate (when batch was purchased/received)
+    // NOT expiryDate or manufactureDate
     if (filters.fromDate || filters.toDate) {
       where.purchaseDate = {};
       if (filters.fromDate) {
@@ -783,7 +1130,7 @@ export class ReportGenerationService {
       transactionType: TransactionType.SALE, // Use enum value 'sale'
     };
 
-    // Status filtering
+    // Status filtering - show all statuses by default, including declined
     if (filters.status) {
       switch (filters.status) {
         case 'approved':
@@ -797,18 +1144,11 @@ export class ReportGenerationService {
           break;
         case 'all_status':
         default:
-          // No status filter - show all except declined by default
-          where.status = {
-            not: 'declined', // Use lowercase to match database
-          };
+          // No status filter - show all including declined
           break;
       }
-    } else {
-      // Default: exclude declined transactions
-      where.status = {
-        not: 'declined', // Use lowercase to match database
-      };
     }
+    // If no status filter, show all transactions (including declined)
 
     if (filters.fromDate || filters.toDate) {
       where.transactionDate = {};
@@ -923,20 +1263,33 @@ export class ReportGenerationService {
   }
 
   // Helper methods for calculating summaries
-  private calculateInventorySummaryWithTotal(data: any[], totalCount: number) {
+  private calculateInventorySummaryWithTotal(
+    data: any[],
+    totalCount: number,
+    dbMetrics?: {
+      expiredCount?: number;
+      expiringSoonCount?: number;
+      lowStockCount?: number;
+      outOfStockCount?: number;
+      totalQuantity?: number;
+      totalValue?: number;
+    },
+  ) {
     const totalItems = data.length;
-    const totalQuantity = data.reduce((sum, item) => sum + item.quantity, 0);
-    const totalValue = data.reduce(
+    
+    // Use database-calculated metrics if provided, otherwise calculate from limited data
+    const totalQuantity = dbMetrics?.totalQuantity ?? data.reduce((sum, item) => sum + item.quantity, 0);
+    const totalValue = dbMetrics?.totalValue ?? data.reduce(
       (sum, item) => sum + item.quantity * item.unitPrice,
       0,
     );
-    const lowStockCount = data.filter(
+    const lowStockCount = dbMetrics?.lowStockCount ?? data.filter(
       (item) => item.status === 'Low Stock',
     ).length;
-    const outOfStockCount = data.filter(
+    const outOfStockCount = dbMetrics?.outOfStockCount ?? data.filter(
       (item) => item.status === 'Out of Stock',
     ).length;
-    const expiringSoonCount = data.filter((item) => {
+    const expiringSoonCount = dbMetrics?.expiringSoonCount ?? data.filter((item) => {
       const expiryDate = new Date(item.expiryDate);
       const daysUntilExpiry = Math.ceil(
         (expiryDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24),
@@ -944,13 +1297,20 @@ export class ReportGenerationService {
       return daysUntilExpiry <= 30 && daysUntilExpiry > 0;
     }).length;
 
-    const expiredCount = data.filter((item) => {
-      const expiryDate = new Date(item.expiryDate);
-      const daysUntilExpiry = Math.ceil(
-        (expiryDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24),
-      );
-      return daysUntilExpiry < 0;
-    }).length;
+    // Use provided expiredCount if available (calculated from database), otherwise calculate from data
+    // Match dashboard/analytics: only count expired batches with currentQty > 0
+    const calculatedExpiredCount =
+      dbMetrics?.expiredCount !== undefined
+        ? dbMetrics.expiredCount
+        : data.filter((item) => {
+            const expiryDate = new Date(item.expiryDate);
+            const daysUntilExpiry = Math.ceil(
+              (expiryDate.getTime() - new Date().getTime()) /
+                (1000 * 60 * 60 * 24),
+            );
+            // Only count expired batches that still have stock (matches dashboard/analytics)
+            return daysUntilExpiry < 0 && item.quantity > 0;
+          }).length;
 
     return {
       totalRecords: totalCount, // Total records in database
@@ -960,24 +1320,36 @@ export class ReportGenerationService {
       lowStockCount,
       outOfStockCount,
       expiringSoonCount,
-      expiredCount,
+      expiredCount: calculatedExpiredCount,
     };
   }
 
-  private calculateInventorySummary(data: any[]) {
+  private calculateInventorySummary(
+    data: any[],
+    dbMetrics?: {
+      expiredCount?: number;
+      expiringSoonCount?: number;
+      lowStockCount?: number;
+      outOfStockCount?: number;
+      totalQuantity?: number;
+      totalValue?: number;
+    },
+  ) {
     const totalItems = data.length;
-    const totalQuantity = data.reduce((sum, item) => sum + item.quantity, 0);
-    const totalValue = data.reduce(
+    
+    // Use database-calculated metrics if provided, otherwise calculate from limited data
+    const totalQuantity = dbMetrics?.totalQuantity ?? data.reduce((sum, item) => sum + item.quantity, 0);
+    const totalValue = dbMetrics?.totalValue ?? data.reduce(
       (sum, item) => sum + item.quantity * item.unitPrice,
       0,
     );
-    const lowStockCount = data.filter(
+    const lowStockCount = dbMetrics?.lowStockCount ?? data.filter(
       (item) => item.status === 'Low Stock',
     ).length;
-    const outOfStockCount = data.filter(
+    const outOfStockCount = dbMetrics?.outOfStockCount ?? data.filter(
       (item) => item.status === 'Out of Stock',
     ).length;
-    const expiringSoonCount = data.filter((item) => {
+    const expiringSoonCount = dbMetrics?.expiringSoonCount ?? data.filter((item) => {
       const expiryDate = new Date(item.expiryDate);
       const daysUntilExpiry = Math.ceil(
         (expiryDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24),
@@ -985,13 +1357,20 @@ export class ReportGenerationService {
       return daysUntilExpiry <= 30 && daysUntilExpiry > 0;
     }).length;
 
-    const expiredCount = data.filter((item) => {
-      const expiryDate = new Date(item.expiryDate);
-      const daysUntilExpiry = Math.ceil(
-        (expiryDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24),
-      );
-      return daysUntilExpiry < 0;
-    }).length;
+    // Use provided expiredCount if available (calculated from database), otherwise calculate from data
+    // Match dashboard/analytics: only count expired batches with currentQty > 0
+    const calculatedExpiredCount =
+      dbMetrics?.expiredCount !== undefined
+        ? dbMetrics.expiredCount
+        : data.filter((item) => {
+            const expiryDate = new Date(item.expiryDate);
+            const daysUntilExpiry = Math.ceil(
+              (expiryDate.getTime() - new Date().getTime()) /
+                (1000 * 60 * 60 * 24),
+            );
+            // Only count expired batches that still have stock (matches dashboard/analytics)
+            return daysUntilExpiry < 0 && item.quantity > 0;
+          }).length;
 
     return {
       totalRecords: totalItems,
@@ -1001,44 +1380,79 @@ export class ReportGenerationService {
       lowStockCount,
       outOfStockCount,
       expiringSoonCount,
-      expiredCount,
+      expiredCount: calculatedExpiredCount,
     };
   }
 
-  private calculateSalesSummaryWithTotal(data: any[], totalCount: number) {
+  private calculateSalesSummaryWithTotal(
+    data: any[],
+    totalCount: number,
+    dbMetrics?: {
+      totalQuantitySold?: number;
+      totalRevenue?: number;
+      totalProfit?: number;
+    },
+  ) {
     const totalTransactions = data.length;
-    const totalQuantitySold = data.reduce(
+    
+    // Use database-calculated metrics if provided, otherwise calculate from limited data
+    // Exclude declined transactions from financial calculations
+    const approvedData = data.filter(
+      (item) => item.status?.toLowerCase() !== 'declined',
+    );
+    
+    const totalQuantitySold = dbMetrics?.totalQuantitySold ?? approvedData.reduce(
       (sum, item) => sum + item.quantitySold,
       0,
     );
-    const totalRevenue = data.reduce((sum, item) => sum + item.totalPrice, 0);
+    const totalRevenue = dbMetrics?.totalRevenue ?? approvedData.reduce((sum, item) => sum + item.totalPrice, 0);
+    // Match analytics: calculate total profit
+    const totalProfit = dbMetrics?.totalProfit ?? approvedData.reduce((sum, item) => sum + (item.profit || 0), 0);
     const averageOrderValue =
-      totalTransactions > 0 ? totalRevenue / totalTransactions : 0;
+      approvedData.length > 0 ? totalRevenue / approvedData.length : 0;
 
     return {
       totalRecords: totalCount, // Total records in database
       totalTransactions,
       totalQuantitySold,
       totalRevenue: Math.round(totalRevenue * 100) / 100,
+      totalProfit: Math.round(totalProfit * 100) / 100, // Add profit to match analytics
       averageOrderValue: Math.round(averageOrderValue * 100) / 100,
     };
   }
 
-  private calculateSalesSummary(data: any[]) {
+  private calculateSalesSummary(
+    data: any[],
+    dbMetrics?: {
+      totalQuantitySold?: number;
+      totalRevenue?: number;
+      totalProfit?: number;
+    },
+  ) {
     const totalTransactions = data.length;
-    const totalQuantitySold = data.reduce(
+    
+    // Use database-calculated metrics if provided, otherwise calculate from limited data
+    // Exclude declined transactions from financial calculations
+    const approvedData = data.filter(
+      (item) => item.status?.toLowerCase() !== 'declined',
+    );
+    
+    const totalQuantitySold = dbMetrics?.totalQuantitySold ?? approvedData.reduce(
       (sum, item) => sum + item.quantitySold,
       0,
     );
-    const totalRevenue = data.reduce((sum, item) => sum + item.totalPrice, 0);
+    const totalRevenue = dbMetrics?.totalRevenue ?? approvedData.reduce((sum, item) => sum + item.totalPrice, 0);
+    // Match analytics: calculate total profit
+    const totalProfit = dbMetrics?.totalProfit ?? approvedData.reduce((sum, item) => sum + (item.profit || 0), 0);
     const averageOrderValue =
-      totalTransactions > 0 ? totalRevenue / totalTransactions : 0;
+      approvedData.length > 0 ? totalRevenue / approvedData.length : 0;
 
     return {
       totalRecords: totalTransactions,
       totalTransactions,
       totalQuantitySold,
       totalRevenue: Math.round(totalRevenue * 100) / 100,
+      totalProfit: Math.round(totalProfit * 100) / 100, // Add profit to match analytics
       averageOrderValue: Math.round(averageOrderValue * 100) / 100,
     };
   }
@@ -1047,15 +1461,23 @@ export class ReportGenerationService {
     data: any[],
     totalCount: number,
     daysThreshold: number,
+    dbMetrics?: {
+      totalQuantity?: number;
+      totalValue?: number;
+      expiredCount?: number;
+      expiringSoonCount?: number;
+    },
   ) {
     const totalBatches = data.length;
-    const totalQuantity = data.reduce(
+    
+    // Use database-calculated metrics if provided, otherwise calculate from limited data
+    const totalQuantity = dbMetrics?.totalQuantity ?? data.reduce(
       (sum, item) => sum + item.quantityRemaining,
       0,
     );
-    const totalValue = data.reduce((sum, item) => sum + item.totalValue, 0);
-    const expiredCount = data.filter((item) => item.daysUntilExpiry < 0).length;
-    const expiringSoonCount = data.filter(
+    const totalValue = dbMetrics?.totalValue ?? data.reduce((sum, item) => sum + item.totalValue, 0);
+    const expiredCount = dbMetrics?.expiredCount ?? data.filter((item) => item.daysUntilExpiry < 0).length;
+    const expiringSoonCount = dbMetrics?.expiringSoonCount ?? data.filter(
       (item) =>
         item.daysUntilExpiry <= daysThreshold && item.daysUntilExpiry >= 0,
     ).length;
@@ -1071,15 +1493,26 @@ export class ReportGenerationService {
     };
   }
 
-  private calculateExpirySummary(data: any[], daysThreshold: number) {
+  private calculateExpirySummary(
+    data: any[],
+    daysThreshold: number,
+    dbMetrics?: {
+      totalQuantity?: number;
+      totalValue?: number;
+      expiredCount?: number;
+      expiringSoonCount?: number;
+    },
+  ) {
     const totalBatches = data.length;
-    const totalQuantity = data.reduce(
+    
+    // Use database-calculated metrics if provided, otherwise calculate from limited data
+    const totalQuantity = dbMetrics?.totalQuantity ?? data.reduce(
       (sum, item) => sum + item.quantityRemaining,
       0,
     );
-    const totalValue = data.reduce((sum, item) => sum + item.totalValue, 0);
-    const expiredCount = data.filter((item) => item.daysUntilExpiry < 0).length;
-    const expiringSoonCount = data.filter(
+    const totalValue = dbMetrics?.totalValue ?? data.reduce((sum, item) => sum + item.totalValue, 0);
+    const expiredCount = dbMetrics?.expiredCount ?? data.filter((item) => item.daysUntilExpiry < 0).length;
+    const expiringSoonCount = dbMetrics?.expiringSoonCount ?? data.filter(
       (item) =>
         item.daysUntilExpiry <= daysThreshold && item.daysUntilExpiry >= 0,
     ).length;
@@ -1095,21 +1528,31 @@ export class ReportGenerationService {
     };
   }
 
-  private calculatePurchaseSummaryWithTotal(data: any[], totalCount: number) {
+  private calculatePurchaseSummaryWithTotal(
+    data: any[],
+    totalCount: number,
+    dbMetrics?: {
+      totalQuantityOrdered?: number;
+      totalQuantityReceived?: number;
+      totalValue?: number;
+    },
+  ) {
     const totalOrders = data.length;
-    const totalItems = data.reduce(
+    
+    // Use database-calculated metrics if provided, otherwise calculate from limited data
+    const totalItems = dbMetrics?.totalQuantityOrdered ?? data.reduce(
       (sum, item) => sum + item.quantityOrdered,
       0,
     );
-    const totalQuantityOrdered = data.reduce(
+    const totalQuantityOrdered = dbMetrics?.totalQuantityOrdered ?? data.reduce(
       (sum, item) => sum + item.quantityOrdered,
       0,
     );
-    const totalQuantityReceived = data.reduce(
+    const totalQuantityReceived = dbMetrics?.totalQuantityReceived ?? data.reduce(
       (sum, item) => sum + item.quantityReceived,
       0,
     );
-    const totalValue = data.reduce((sum, item) => sum + item.totalCost, 0);
+    const totalValue = dbMetrics?.totalValue ?? data.reduce((sum, item) => sum + item.totalCost, 0);
     const averageFulfillmentRate =
       totalOrders > 0
         ? data.reduce((sum, item) => sum + item.fulfillmentRate, 0) /
@@ -1136,21 +1579,30 @@ export class ReportGenerationService {
     };
   }
 
-  private calculatePurchaseSummary(data: any[]) {
+  private calculatePurchaseSummary(
+    data: any[],
+    dbMetrics?: {
+      totalQuantityOrdered?: number;
+      totalQuantityReceived?: number;
+      totalValue?: number;
+    },
+  ) {
     const totalOrders = data.length;
-    const totalItems = data.reduce(
+    
+    // Use database-calculated metrics if provided, otherwise calculate from limited data
+    const totalItems = dbMetrics?.totalQuantityOrdered ?? data.reduce(
       (sum, item) => sum + item.quantityOrdered,
       0,
     );
-    const totalQuantityOrdered = data.reduce(
+    const totalQuantityOrdered = dbMetrics?.totalQuantityOrdered ?? data.reduce(
       (sum, item) => sum + item.quantityOrdered,
       0,
     );
-    const totalQuantityReceived = data.reduce(
+    const totalQuantityReceived = dbMetrics?.totalQuantityReceived ?? data.reduce(
       (sum, item) => sum + item.quantityReceived,
       0,
     );
-    const totalValue = data.reduce((sum, item) => sum + item.totalCost, 0);
+    const totalValue = dbMetrics?.totalValue ?? data.reduce((sum, item) => sum + item.totalCost, 0);
     const averageFulfillmentRate =
       totalOrders > 0
         ? data.reduce((sum, item) => sum + item.fulfillmentRate, 0) /

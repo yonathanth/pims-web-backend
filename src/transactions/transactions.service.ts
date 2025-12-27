@@ -64,15 +64,15 @@ export class TransactionsService {
       // Only update batch quantity for non-sale transactions
       // Sales will deduct inventory when approved
       if (!isSale) {
-        const updatedBatch = await tx.batch.update({
-          where: { id: batch.id },
-          data: { currentQty: { increment: delta } },
-        });
+      const updatedBatch = await tx.batch.update({
+        where: { id: batch.id },
+        data: { currentQty: { increment: delta } },
+      });
 
-        if (updatedBatch.currentQty < 0) {
-          throw new BadRequestException(
-            'Insufficient batch quantity for this transaction',
-          );
+      if (updatedBatch.currentQty < 0) {
+        throw new BadRequestException(
+          'Insufficient batch quantity for this transaction',
+        );
         }
       }
 
@@ -95,7 +95,7 @@ export class TransactionsService {
     // Evaluate stock notifications after transaction (only for non-sale transactions)
     // Sales will trigger notifications when approved
     if (!isSale) {
-      await this.notificationsService.evaluateBatchStock(dto.batchId);
+    await this.notificationsService.evaluateBatchStock(dto.batchId);
     }
 
     return result;
