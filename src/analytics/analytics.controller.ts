@@ -67,7 +67,7 @@ export class AnalyticsController {
   }
 
   @Post('upload/trigger')
-  @Roles(UserRole.ADMIN, UserRole.MANAGER)
+  // Allow all authenticated users to trigger upload
   @ApiOperation({
     summary: 'Manually trigger an analytics upload',
     description:
@@ -94,7 +94,7 @@ export class AnalyticsController {
   @ApiOperation({
     summary: 'Manually trigger period-based sync (all roles allowed)',
     description:
-      'Forces the period sync to run immediately for all periods (daily, weekly, monthly, yearly). Pass force=true to bypass hash deduplication.',
+      'Forces the period sync to run immediately for all periods (daily, weekly, monthly, yearly). Manual upload always forces fresh data (ignores hash).',
   })
   @ApiResponse({
     status: 200,
@@ -103,8 +103,10 @@ export class AnalyticsController {
   async triggerPeriodSync(
     @Query('force', new DefaultValuePipe(false), ParseBoolPipe) force: boolean,
   ) {
-    console.log(`🔄 Manual period sync triggered (force=${force})`);
-    const results = await this.periodUploader.syncAllPeriods(force);
+    // Manual upload always forces update (fresh data every time)
+    const forceUpdate = true;
+    console.log(`🔄 Manual period sync triggered (force=${forceUpdate} - always fresh data)`);
+    const results = await this.periodUploader.syncAllPeriods(forceUpdate);
     console.log(`✅ Period sync completed:`, results);
     return {
       results,

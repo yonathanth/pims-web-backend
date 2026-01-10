@@ -61,7 +61,9 @@ export class AnalyticsUploaderService implements OnModuleInit {
 
       if (lastSuccessConfig) {
         this.status.lastSuccessAt = lastSuccessConfig;
-        this.logger.debug(`Loaded persisted lastSuccessAt: ${lastSuccessConfig}`);
+        this.logger.log(`✅ Loaded persisted lastSuccessAt from database: ${lastSuccessConfig}`);
+      } else {
+        this.logger.debug('No persisted lastSuccessAt found in database for old uploader');
       }
       if (lastHashConfig) {
         this.previousHash = lastHashConfig;
@@ -88,14 +90,45 @@ export class AnalyticsUploaderService implements OnModuleInit {
       this.status.lastDurationMs = Date.now() - attemptStart;
       
       if (dailyResult?.outcome === 'uploaded') {
-        this.status.lastSuccessAt = new Date().toISOString();
+        const successTimestamp = new Date().toISOString();
+        this.status.lastSuccessAt = successTimestamp;
         this.status.lastHash = dailyResult.hash || null;
         this.status.lastResponseCode = 200;
         this.status.lastError = null;
+        // Persist lastSuccessAt to database
+        try {
+          await this.generalConfigs.setTypedValue(
+            this.CONFIG_KEY_LAST_SUCCESS,
+            successTimestamp,
+            'string',
+          );
+          if (dailyResult.hash) {
+            await this.generalConfigs.setTypedValue(
+              this.CONFIG_KEY_LAST_HASH,
+              dailyResult.hash,
+              'string',
+            );
+          }
+          this.logger.debug('Persisted upload status to database after period sync');
+        } catch (error) {
+          this.logger.warn('Failed to persist upload status after period sync:', error);
+        }
         this.logger.log('✅ Period sync completed via old uploader cron');
       } else if (dailyResult?.outcome === 'skipped-no-change') {
         this.status.lastSkipReason = 'no-change';
         this.status.lastHash = dailyResult.hash || null;
+        // Persist hash even on skip
+        if (dailyResult.hash) {
+          try {
+            await this.generalConfigs.setTypedValue(
+              this.CONFIG_KEY_LAST_HASH,
+              dailyResult.hash,
+              'string',
+            );
+          } catch (error) {
+            this.logger.warn('Failed to persist hash after skip:', error);
+          }
+        }
         this.logger.log('⏭️ Period sync skipped (no changes) via old uploader cron');
       } else {
         this.status.lastError = dailyResult?.message || 'Period sync failed';
@@ -126,9 +159,28 @@ export class AnalyticsUploaderService implements OnModuleInit {
       this.status.lastDurationMs = Date.now() - attemptStart;
       
       if (dailyResult?.outcome === 'uploaded') {
-        this.status.lastSuccessAt = new Date().toISOString();
+        const successTimestamp = new Date().toISOString();
+        this.status.lastSuccessAt = successTimestamp;
         this.status.lastHash = dailyResult.hash || null;
         this.status.lastResponseCode = 200;
+        // Persist lastSuccessAt to database
+        try {
+          await this.generalConfigs.setTypedValue(
+            this.CONFIG_KEY_LAST_SUCCESS,
+            successTimestamp,
+            'string',
+          );
+          if (dailyResult.hash) {
+            await this.generalConfigs.setTypedValue(
+              this.CONFIG_KEY_LAST_HASH,
+              dailyResult.hash,
+              'string',
+            );
+          }
+          this.logger.debug('Persisted upload status to database after manual trigger');
+        } catch (error) {
+          this.logger.warn('Failed to persist upload status after manual trigger:', error);
+        }
         return {
           outcome: dailyResult.outcome as UploadOutcome,
           message: dailyResult.message || 'Period sync completed',
@@ -136,6 +188,18 @@ export class AnalyticsUploaderService implements OnModuleInit {
       } else if (dailyResult?.outcome === 'skipped-no-change') {
         this.status.lastSkipReason = 'no-change';
         this.status.lastHash = dailyResult.hash || null;
+        // Persist hash even on skip
+        if (dailyResult.hash) {
+          try {
+            await this.generalConfigs.setTypedValue(
+              this.CONFIG_KEY_LAST_HASH,
+              dailyResult.hash,
+              'string',
+            );
+          } catch (error) {
+            this.logger.warn('Failed to persist hash after skip:', error);
+          }
+        }
         return {
           outcome: 'skipped-no-change',
           message: dailyResult.message || 'No changes detected',
@@ -165,10 +229,21 @@ export class AnalyticsUploaderService implements OnModuleInit {
     const periodStatus = this.periodUploader.getStatus();
     
     // Merge period uploader status with old format for backward compatibility
+    // Prefer period uploader's lastSuccessAt if available, otherwise use old uploader's
+    // The period uploader is the source of truth since it's the one actually doing uploads now
+    const lastSuccessAt = periodStatus.lastSuccessAt || this.status.lastSuccessAt;
+    
+    // Log detailed status for debugging
+    if (!lastSuccessAt) {
+      this.logger.warn(`⚠️ getStatus() - No lastSuccessAt found. periodStatus.lastSuccessAt: ${periodStatus.lastSuccessAt}, this.status.lastSuccessAt: ${this.status.lastSuccessAt}. This means no successful upload has occurred yet.`);
+    } else {
+      this.logger.debug(`✅ getStatus() - lastSuccessAt: ${lastSuccessAt} (from ${periodStatus.lastSuccessAt ? 'period uploader' : 'old uploader'})`);
+    }
+    
     return {
       running: periodStatus.running || this.running,
       lastAttemptAt: this.status.lastAttemptAt,
-      lastSuccessAt: this.status.lastSuccessAt,
+      lastSuccessAt: lastSuccessAt,
       lastHash: periodStatus.lastHashes?.daily || this.status.lastHash,
       lastResponseCode: this.status.lastResponseCode,
       lastDurationMs: this.status.lastDurationMs,

@@ -247,7 +247,7 @@ export class BatchesService {
       }
     }
 
-    // Search via relations (drug.sku/name or supplier.name) or batchNumber
+    // Search via relations (drug.sku/name, supplier.name, category.name, location.name) or batchNumber
     if (query?.search) {
       where.OR = [
         {
@@ -264,12 +264,28 @@ export class BatchesService {
           } as any,
         },
         {
+          drug: {
+            category: {
+              name: { contains: query.search, mode: 'insensitive' },
+            },
+          } as any,
+        },
+        {
           supplier: {
             name: { contains: query.search, mode: 'insensitive' },
           } as any,
         },
         {
           batchNumber: { contains: query.search, mode: 'insensitive' },
+        },
+        {
+          locationBatches: {
+            some: {
+              location: {
+                name: { contains: query.search, mode: 'insensitive' },
+              },
+            },
+          },
         },
       ];
     }
@@ -298,6 +314,11 @@ export class BatchesService {
               genericName: true,
               tradeName: true,
               strength: true,
+              category: {
+                select: {
+                  name: true,
+                },
+              },
             },
           },
           supplier: {

@@ -33,6 +33,8 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
   private readonly logger = new Logger(AnalyticsPeriodUploaderService.name);
   private previousHashes: Map<string, string> = new Map();
   private running = false;
+  private lastSuccessAt: string | null = null;
+  private readonly CONFIG_KEY_LAST_SUCCESS = 'analytics_period_upload_last_success_at';
 
   constructor(
     private readonly analyticsService: AnalyticsService,
@@ -41,7 +43,7 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    // Load persisted hashes from database
+    // Load persisted hashes and lastSuccessAt from database
     try {
       const periods: Period[] = ['daily', 'weekly', 'monthly', 'yearly'];
       for (const period of periods) {
@@ -55,8 +57,20 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
           this.logger.debug(`Loaded persisted hash for ${period}: ${hashConfig}`);
         }
       }
+
+      // Load lastSuccessAt
+      const lastSuccessConfig = await this.generalConfigs
+        .getTypedValue<string>(this.CONFIG_KEY_LAST_SUCCESS, 'string')
+        .catch(() => null);
+
+      if (lastSuccessConfig) {
+        this.lastSuccessAt = lastSuccessConfig;
+        this.logger.log(`✅ Period uploader: Loaded persisted lastSuccessAt from database: ${lastSuccessConfig}`);
+      } else {
+        this.logger.warn(`⚠️ Period uploader: No persisted lastSuccessAt found in database (key: ${this.CONFIG_KEY_LAST_SUCCESS}). This means no successful upload has occurred yet.`);
+      }
     } catch (error) {
-      this.logger.warn('Failed to load persisted upload hashes:', error);
+      this.logger.warn('Failed to load persisted upload data:', error);
     }
   }
 
@@ -126,21 +140,38 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
         dateIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
         break;
       case 'weekly':
-        // Last 7 days
+        // Current calendar week (Monday to Sunday) - matches sales service exactly
         timeFilter = TimeFilter.Custom;
         const weekStart = new Date(today);
-        weekStart.setDate(today.getDate() - 7);
+        const dayOfWeek = weekStart.getDay();
+        const diff = weekStart.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1); // Monday
+        weekStart.setDate(diff);
         weekStart.setHours(0, 0, 0, 0);
+        // End is Sunday of current week (end of today, which is already in the current week)
         const weekEnd = new Date(today);
         weekEnd.setHours(23, 59, 59, 999);
         startIso = weekStart.toISOString();
         endIso = weekEnd.toISOString();
         break;
       case 'monthly':
-        timeFilter = TimeFilter.Monthly;
+        // Current calendar month - matches sales service
+        timeFilter = TimeFilter.Custom;
+        const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+        monthStart.setHours(0, 0, 0, 0);
+        const monthEnd = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+        monthEnd.setHours(23, 59, 59, 999);
+        startIso = monthStart.toISOString();
+        endIso = monthEnd.toISOString();
         break;
       case 'yearly':
-        timeFilter = TimeFilter.Yearly;
+        // Current calendar year - matches sales service
+        timeFilter = TimeFilter.Custom;
+        const yearStart = new Date(today.getFullYear(), 0, 1);
+        yearStart.setHours(0, 0, 0, 0);
+        const yearEnd = new Date(today.getFullYear(), 11, 31);
+        yearEnd.setHours(23, 59, 59, 999);
+        startIso = yearStart.toISOString();
+        endIso = yearEnd.toISOString();
         break;
     }
 
@@ -200,20 +231,21 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
     try {
       this.running = true;
 
-      const payload = {
+      // Create data payload (without timestamp for hash calculation)
+      const dataPayload = {
         period,
         analytics: this.mapAnalyticsPayload(analytics),
         sales: this.mapSalesPayload(sales, period),
-        uploadedAt: new Date().toISOString(),
       };
 
-      const json = JSON.stringify(payload);
-      const hash = await this.sha256(json);
+      // Compute hash from data only (exclude timestamp)
+      const hash = await this.sha256(JSON.stringify(dataPayload));
       const hashKey = period;
 
-      // Add hash to payload
+      // Add timestamp and hash to final payload
       const payloadWithHash = {
-        ...payload,
+        ...dataPayload,
+        uploadedAt: new Date().toISOString(),
         hash,
       };
       const jsonWithHash = JSON.stringify(payloadWithHash);
@@ -221,6 +253,8 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
       // Check if changed
       if (!force && this.previousHashes.get(hashKey) === hash) {
         this.logger.debug(`No changes detected for ${period} period; skipping upload`);
+        // IMPORTANT: Even when skipping, we should preserve the existing lastSuccessAt
+        // Don't update it, but also don't clear it - it should show the last successful upload time
         return {
           outcome: 'skipped-no-change',
           message: `No changes detected for ${period} period`,
@@ -263,13 +297,24 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
         // Update hash
         this.previousHashes.set(hashKey, hash);
 
-        // Persist hash to database
+        // Update lastSuccessAt timestamp
+        const successTimestamp = new Date().toISOString();
+        this.lastSuccessAt = successTimestamp;
+        this.logger.debug(`Updated lastSuccessAt to: ${successTimestamp}`);
+
+        // Persist hash and lastSuccessAt to database
         try {
           const hashConfigKey = `period_upload_hash_${period}`;
           await this.generalConfigs.setTypedValue(hashConfigKey, hash, 'string');
-          this.logger.debug(`Persisted hash for ${period} period to database`);
+          await this.generalConfigs.setTypedValue(
+            this.CONFIG_KEY_LAST_SUCCESS,
+            successTimestamp,
+            'string',
+          );
+          this.logger.log(`✅ Period uploader: Persisted hash for ${period} period and lastSuccessAt (${successTimestamp}) to database (key: ${this.CONFIG_KEY_LAST_SUCCESS})`);
         } catch (error) {
-          this.logger.warn(`Failed to persist hash for ${period} period:`, error);
+          this.logger.error(`❌ Period uploader: Failed to persist data for ${period} period:`, error);
+          // Don't throw - we still want to return success even if persistence fails
         }
 
         this.logger.log(`Successfully synced ${period} period data`);
@@ -396,10 +441,11 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
     return crypto.createHash('sha256').update(text).digest('hex');
   }
 
-  getStatus(): { running: boolean; lastHashes: Record<string, string> } {
+  getStatus(): { running: boolean; lastHashes: Record<string, string>; lastSuccessAt: string | null } {
     return {
       running: this.running,
       lastHashes: Object.fromEntries(this.previousHashes),
+      lastSuccessAt: this.lastSuccessAt,
     };
   }
 }
