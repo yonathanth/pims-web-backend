@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { GeneralConfigsService } from '../general-configs/general-configs.service';
+import { ConfigStoreService } from '../general-configs/config-store.service';
 import {
   AnalyticsResponse,
   KeyMetric,
@@ -19,10 +19,126 @@ import {
 
 @Injectable()
 export class AnalyticsService {
+  // ConfigStoreService (not the request-scoped GeneralConfigsService) keeps this
+  // a singleton, so the scheduled uploaders that depend on it can run
   constructor(
     private prisma: PrismaService,
-    private generalConfigs: GeneralConfigsService,
+    private configStore: ConfigStoreService,
   ) {}
+
+  /**
+   * Fast and slow movers over a rolling window, combined per product (drug)
+   * rather than per batch, so a drug with several batches appears once.
+   * Fast: most units sold. Slow: products in stock with the fewest units sold,
+   * ties broken by the most stock on hand (more capital tied up).
+   */
+  async movingProductsByDrug(
+    days: number,
+    limit: number,
+  ): Promise<{ fast: ProductDto[]; slow: ProductDto[] }> {
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const [salesByBatch, stockBatches] = await Promise.all([
+      this.prisma.transaction.groupBy({
+        by: ['batchId'],
+        _sum: { quantity: true },
+        where: {
+          transactionType: {
+            in: [...AnalyticsService.SALE_TYPES],
+            mode: 'insensitive',
+          },
+          status: 'approved',
+          transactionDate: { gte: since },
+        },
+      }),
+      this.prisma.batch.findMany({
+        where: { currentQty: { gt: 0 } },
+        select: {
+          drugId: true,
+          currentQty: true,
+          unitPrice: true,
+          purchaseDate: true,
+        },
+      }),
+    ]);
+
+    const soldBatchIds = salesByBatch.map((s) => s.batchId);
+    const soldBatches = soldBatchIds.length
+      ? await this.prisma.batch.findMany({
+          where: { id: { in: soldBatchIds } },
+          select: { id: true, drugId: true },
+        })
+      : [];
+    const drugOfBatch = new Map(soldBatches.map((b) => [b.id, b.drugId]));
+
+    type Row = {
+      soldQty: number;
+      stockQty: number;
+      unitPrice: number;
+      lastRestock: Date | null;
+    };
+    const rows = new Map<number, Row>();
+    const row = (drugId: number) => {
+      let r = rows.get(drugId);
+      if (!r) {
+        r = { soldQty: 0, stockQty: 0, unitPrice: 0, lastRestock: null };
+        rows.set(drugId, r);
+      }
+      return r;
+    };
+    for (const s of salesByBatch) {
+      const drugId = drugOfBatch.get(s.batchId);
+      if (drugId !== undefined) row(drugId).soldQty += s._sum.quantity || 0;
+    }
+    for (const b of stockBatches) {
+      const r = row(b.drugId);
+      r.stockQty += b.currentQty;
+      // Price of the most recently purchased batch in stock
+      if (!r.lastRestock || b.purchaseDate > r.lastRestock) {
+        r.lastRestock = b.purchaseDate;
+        r.unitPrice = b.unitPrice;
+      }
+    }
+
+    const fastIds = [...rows.entries()]
+      .filter(([, r]) => r.soldQty > 0)
+      .sort((a, b) => b[1].soldQty - a[1].soldQty)
+      .slice(0, limit);
+    const slowIds = [...rows.entries()]
+      .filter(([, r]) => r.stockQty > 0)
+      .sort(
+        (a, b) => a[1].soldQty - b[1].soldQty || b[1].stockQty - a[1].stockQty,
+      )
+      .slice(0, limit);
+
+    const ids = [...new Set([...fastIds, ...slowIds].map(([id]) => id))];
+    const drugs = ids.length
+      ? await this.prisma.drug.findMany({
+          where: { id: { in: ids } },
+          select: { id: true, sku: true, genericName: true, tradeName: true },
+        })
+      : [];
+    const drugById = new Map(drugs.map((d) => [d.id, d]));
+
+    const toDto = ([drugId, r]: [number, Row]): ProductDto | null => {
+      const drug = drugById.get(drugId);
+      if (!drug) return null;
+      return {
+        genericName: drug.genericName,
+        tradeName: drug.tradeName || undefined,
+        sku: drug.sku || undefined,
+        quantity: r.stockQty, // units in stock now
+        unitPrice: r.unitPrice,
+        lastRestock: r.lastRestock?.toISOString().split('T')[0],
+        orderedQty: r.soldQty, // units sold in the window
+      };
+    };
+
+    return {
+      fast: fastIds.map(toDto).filter((d): d is ProductDto => d !== null),
+      slow: slowIds.map(toDto).filter((d): d is ProductDto => d !== null),
+    };
+  }
 
   // Centralized transaction type constants to avoid magic strings
   private static readonly SALE_TYPES = ['sale'] as const;
@@ -35,43 +151,110 @@ export class AnalyticsService {
     dateIso?: string,
   ): { currentStart: Date; currentEnd: Date; prevStart: Date; prevEnd: Date } {
     const now = new Date();
+
+    // Normalise "undefined" (All time) to a sensible default.
+    // To stay consistent with the Sales "yearly" period, we treat it
+    // as the current calendar year.
+    const effectiveFilter = timeFilter ?? TimeFilter.Yearly;
+
     let currentStart: Date;
-    let currentEnd: Date = now;
+    let currentEnd: Date;
     let prevStart: Date;
     let prevEnd: Date;
 
-    if (timeFilter === TimeFilter.Custom && startIso) {
-      currentStart = new Date(startIso);
-      currentEnd = endIso ? new Date(endIso) : now;
+    if (effectiveFilter === TimeFilter.Custom && startIso) {
+      // Custom: use explicit start/end ISO dates, like SalesService.getProductSales
+      const start = new Date(startIso);
+      const end = endIso ? new Date(endIso) : now;
+      start.setHours(0, 0, 0, 0);
+      end.setHours(23, 59, 59, 999);
+      currentStart = start;
+      currentEnd = end;
+
       const len = currentEnd.getTime() - currentStart.getTime();
       prevEnd = new Date(currentStart.getTime() - 1);
       prevStart = new Date(prevEnd.getTime() - len);
-    } else if (timeFilter === TimeFilter.Date && dateIso) {
-      // Single day: [date start, next day start)
+    } else if (effectiveFilter === TimeFilter.Date && dateIso) {
+      // Single day: align to that calendar day [00:00, 23:59:59.999]
       const d = new Date(dateIso);
-      currentStart = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-      currentEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
-      // previous day window
+      currentStart = new Date(
+        d.getFullYear(),
+        d.getMonth(),
+        d.getDate(),
+        0,
+        0,
+        0,
+        0,
+      );
+      currentEnd = new Date(
+        d.getFullYear(),
+        d.getMonth(),
+        d.getDate(),
+        23,
+        59,
+        59,
+        999,
+      );
+
+      // Previous day window
+      prevEnd = new Date(currentStart.getTime() - 1);
       prevStart = new Date(currentStart.getTime() - 24 * 60 * 60 * 1000);
-      prevEnd = currentStart;
     } else {
-      switch (timeFilter) {
-        case TimeFilter.Daily:
-          currentStart = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-          prevStart = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
-          prevEnd = currentStart;
+      switch (effectiveFilter) {
+        case TimeFilter.Daily: {
+          // Today, matching SalesService.getDateRange(Daily)
+          currentStart = new Date(now);
+          currentStart.setHours(0, 0, 0, 0);
+          currentEnd = new Date(now);
+          currentEnd.setHours(23, 59, 59, 999);
+
+          // Previous day
+          prevStart = new Date(currentStart.getTime() - 24 * 60 * 60 * 1000);
+          prevEnd = new Date(currentStart.getTime() - 1);
           break;
-        case TimeFilter.Monthly:
-          currentStart = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-          prevStart = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000);
-          prevEnd = currentStart;
+        }
+        case TimeFilter.Monthly: {
+          // Current calendar month, matching Sales monthly
+          currentStart = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            1,
+            0,
+            0,
+            0,
+            0,
+          );
+          currentEnd = new Date(
+            now.getFullYear(),
+            now.getMonth() + 1,
+            0,
+            23,
+            59,
+            59,
+            999,
+          );
+
+          // Previous calendar month
+          const prevMonth = now.getMonth() - 1;
+          const prevYear =
+            prevMonth < 0 ? now.getFullYear() - 1 : now.getFullYear();
+          const monthIndex = (prevMonth + 12) % 12;
+          prevStart = new Date(prevYear, monthIndex, 1, 0, 0, 0, 0);
+          prevEnd = new Date(prevYear, monthIndex + 1, 0, 23, 59, 59, 999);
           break;
+        }
         case TimeFilter.Yearly:
-        default:
-          currentStart = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
-          prevStart = new Date(now.getTime() - 2 * 365 * 24 * 60 * 60 * 1000);
-          prevEnd = currentStart;
+        default: {
+          // Current calendar year, matching Sales yearly
+          const year = now.getFullYear();
+          currentStart = new Date(year, 0, 1, 0, 0, 0, 0);
+          currentEnd = new Date(year, 11, 31, 23, 59, 59, 999);
+
+          const prevYear = year - 1;
+          prevStart = new Date(prevYear, 0, 1, 0, 0, 0, 0);
+          prevEnd = new Date(prevYear, 11, 31, 23, 59, 59, 999);
           break;
+        }
       }
     }
 
@@ -86,12 +269,13 @@ export class AnalyticsService {
           mode: 'insensitive',
         },
         status: 'approved',
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
       include: { batch: true },
     });
     return transactions.reduce(
-      (sum, t) => sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
+      (sum, t) =>
+        sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
       0,
     );
   }
@@ -104,14 +288,16 @@ export class AnalyticsService {
           mode: 'insensitive',
         },
         status: 'approved',
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
       include: { batch: true },
     });
     return transactions.reduce(
       (sum, t) =>
         sum +
-        t.quantity * (((t as any).unitPrice ?? t.batch?.unitPrice ?? 0) - (t.batch?.unitCost || 0)),
+        t.quantity *
+          (((t as any).unitPrice ?? t.batch?.unitPrice ?? 0) -
+            (t.batch?.unitCost || 0)),
       0,
     );
   }
@@ -125,7 +311,7 @@ export class AnalyticsService {
           mode: 'insensitive',
         },
         status: 'approved',
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
     });
     return result._sum.quantity || 0;
@@ -139,7 +325,7 @@ export class AnalyticsService {
           in: [...AnalyticsService.RECEIVE_TYPES],
           mode: 'insensitive',
         },
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
     });
     return result._sum.quantity || 0;
@@ -151,7 +337,7 @@ export class AnalyticsService {
   ): Promise<number> {
     return await this.prisma.transaction.count({
       where: {
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
     });
   }
@@ -167,12 +353,13 @@ export class AnalyticsService {
           mode: 'insensitive',
         },
         status: 'approved',
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
       include: { batch: true },
     });
     const totalValue = transactions.reduce(
-      (sum, t) => sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
+      (sum, t) =>
+        sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
       0,
     );
     const totalQty = transactions.reduce((sum, t) => sum + t.quantity, 0);
@@ -187,7 +374,7 @@ export class AnalyticsService {
           mode: 'insensitive',
         },
         status: 'approved',
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
       include: { batch: true },
     });
@@ -204,12 +391,13 @@ export class AnalyticsService {
           in: [...AnalyticsService.RECEIVE_TYPES],
           mode: 'insensitive',
         },
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
       include: { batch: true },
     });
     return transactions.reduce(
-      (sum, t) => sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
+      (sum, t) =>
+        sum + t.quantity * ((t as any).unitPrice ?? t.batch?.unitPrice ?? 0),
       0,
     );
   }
@@ -261,7 +449,8 @@ export class AnalyticsService {
       },
     });
     return lowStockBatches.filter(
-      (batch) => batch.currentQty > 0 && batch.currentQty <= batch.lowStockThreshold,
+      (batch) =>
+        batch.currentQty > 0 && batch.currentQty <= batch.lowStockThreshold,
     ).length;
   }
 
@@ -360,7 +549,7 @@ export class AnalyticsService {
     });
     const flows = await this.drugFlowsAfter(prevEnd, currentEnd);
     const currentQty = await this.currentDrugQuantities();
-    
+
     // Group batches by drug and calculate previous quantities
     const drugBatches = new Map<number, typeof batches>();
     batches.forEach((b) => {
@@ -369,29 +558,33 @@ export class AnalyticsService {
       }
       drugBatches.get(b.drugId)!.push(b);
     });
-    
+
     let low = 0;
     let out = 0;
-    
+
     drugBatches.forEach((batchesForDrug, drugId) => {
       const f = flows.get(drugId) || { received: 0, sold: 0 };
       const currentDrugQty = currentQty.get(drugId) || 0;
       const prevDrugQty = currentDrugQty - f.received + f.sold;
-      
+
       // Estimate previous quantity per batch proportionally
-      const totalCurrent = batchesForDrug.reduce((sum, b) => sum + b.currentQty, 0);
+      const totalCurrent = batchesForDrug.reduce(
+        (sum, b) => sum + b.currentQty,
+        0,
+      );
       if (totalCurrent === 0) {
         // If all batches are empty now, check if they were empty before
         if (prevDrugQty <= 0) out += batchesForDrug.length;
         return;
       }
-      
+
       batchesForDrug.forEach((batch) => {
         // Estimate previous quantity for this batch
-        const prevBatchQty = totalCurrent > 0 
-          ? (batch.currentQty / totalCurrent) * prevDrugQty
-          : 0;
-        
+        const prevBatchQty =
+          totalCurrent > 0
+            ? (batch.currentQty / totalCurrent) * prevDrugQty
+            : 0;
+
         if (prevBatchQty <= 0) {
           out += 1;
         } else if (prevBatchQty <= batch.lowStockThreshold) {
@@ -399,7 +592,7 @@ export class AnalyticsService {
         }
       });
     });
-    
+
     return { lowStockPrev: low, outOfStockPrev: out };
   }
 
@@ -417,7 +610,7 @@ export class AnalyticsService {
           mode: 'insensitive',
         },
         status: 'approved',
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
       orderBy: { _sum: { quantity: 'desc' } },
       take: limit,
@@ -447,7 +640,7 @@ export class AnalyticsService {
     const items = await this.prisma.purchaseOrderItem.findMany({
       where: {
         purchaseOrder: {
-          createdDate: { gte: start, lt: end },
+          createdDate: { gte: start, lte: end },
         },
       },
       include: {
@@ -466,15 +659,16 @@ export class AnalyticsService {
     });
     return items.map((item) => {
       // Get location names from batch if it exists (comma-separated if multiple)
-      const locationNames = item.batch?.locationBatches
-        ?.map((lb) => lb.location.name)
-        .join(', ') || undefined;
+      const locationNames =
+        item.batch?.locationBatches?.map((lb) => lb.location.name).join(', ') ||
+        undefined;
 
       return {
         genericName: item.drug.tradeName ?? item.drug.genericName,
         tradeName: item.drug.tradeName || undefined,
         sku: item.drug.sku || undefined,
-        batchNumber: item.batch?.batchNumber ?? (item.batch?.id.toString() || undefined),
+        batchNumber:
+          item.batch?.batchNumber ?? (item.batch?.id.toString() || undefined),
         expiryDate:
           item.batch?.expiryDate?.toISOString().split('T')[0] || undefined,
         quantity: item.quantityReceived,
@@ -520,17 +714,17 @@ export class AnalyticsService {
     const suppliers = await this.prisma.supplier.findMany({
       include: {
         purchaseOrders: {
-          include: { 
-            items: { 
-              include: { 
+          include: {
+            items: {
+              include: {
                 drug: true,
                 batch: {
                   select: {
                     unitCost: true,
                   },
                 },
-              } 
-            } 
+              },
+            },
           },
         },
       },
@@ -550,18 +744,16 @@ export class AnalyticsService {
           }, 0),
         0,
       );
-      const ordersDelivered = s.purchaseOrders.filter(
-        (po) => {
-          // An order is "delivered" only if ALL its items have status "Complete"
-          // We check item status, not order status, since item status is more reliable
-          if (po.items.length === 0) return false;
-          
-          // All items must be "Complete" (case-insensitive, trimmed)
-          return po.items.every(
-            (item) => item.status?.toLowerCase().trim() === 'complete',
-          );
-        },
-      ).length;
+      const ordersDelivered = s.purchaseOrders.filter((po) => {
+        // An order is "delivered" only if ALL its items have status "Complete"
+        // We check item status, not order status, since item status is more reliable
+        if (po.items.length === 0) return false;
+
+        // All items must be "Complete" (case-insensitive, trimmed)
+        return po.items.every(
+          (item) => item.status?.toLowerCase().trim() === 'complete',
+        );
+      }).length;
       const totalOrders = s.purchaseOrders.length;
       const orderCompletionPct =
         totalOrders > 0 ? (ordersDelivered / totalOrders) * 100 : 0;
@@ -611,7 +803,7 @@ export class AnalyticsService {
     // Count suppliers that have purchase orders in the last N days
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - days);
-    
+
     const suppliers = await this.prisma.supplier.findMany({
       where: {
         purchaseOrders: {
@@ -686,7 +878,7 @@ export class AnalyticsService {
           mode: 'insensitive',
         },
         status: 'approved',
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
     });
     const withUsers = await Promise.all(
@@ -729,8 +921,7 @@ export class AnalyticsService {
       categories.map(async (c) => {
         // Use batch.currentQty for consistency with dashboard
         const stockQty = c.drugs.reduce(
-          (sum, d) =>
-            sum + d.batches.reduce((s, b) => s + b.currentQty, 0),
+          (sum, d) => sum + d.batches.reduce((s, b) => s + b.currentQty, 0),
           0,
         );
         // Calculate soldQty from all approved sale transactions (not time-filtered)
@@ -764,16 +955,25 @@ export class AnalyticsService {
     // If start/end dates are provided, use those; otherwise use monthsBack from now.
     const now = end || new Date();
     const months: { start: Date; end: Date; label: string }[] = [];
-    
+
     if (start && end) {
       // Use custom date range - break it into months
       const rangeStart = new Date(start);
       const rangeEnd = new Date(end);
-      let currentMonth = new Date(rangeStart.getFullYear(), rangeStart.getMonth(), 1);
-      
+      let currentMonth = new Date(
+        rangeStart.getFullYear(),
+        rangeStart.getMonth(),
+        1,
+      );
+
       while (currentMonth < rangeEnd) {
-        const monthStart = currentMonth > rangeStart ? currentMonth : rangeStart;
-        const nextMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 1);
+        const monthStart =
+          currentMonth > rangeStart ? currentMonth : rangeStart;
+        const nextMonth = new Date(
+          currentMonth.getFullYear(),
+          currentMonth.getMonth() + 1,
+          1,
+        );
         const monthEnd = nextMonth < rangeEnd ? nextMonth : rangeEnd;
         const label = `${currentMonth.getFullYear()}-${(currentMonth.getMonth() + 1).toString().padStart(2, '0')}`;
         months.push({ start: monthStart, end: monthEnd, label });
@@ -788,7 +988,7 @@ export class AnalyticsService {
         months.push({ start: monthStart, end: monthEnd, label });
       }
     }
-    
+
     const points: MonthlySeriesPoint[] = [];
     for (const m of months) {
       // Stocked: sum of currentQty for batches created in this month
@@ -796,16 +996,13 @@ export class AnalyticsService {
       // Uses purchaseDate to determine when inventory was stocked
       const stockedBatches = await this.prisma.batch.findMany({
         where: {
-          purchaseDate: { gte: m.start, lt: m.end },
+          purchaseDate: { gte: m.start, lte: m.end },
         },
         select: {
           currentQty: true,
         },
       });
-      const stocked = stockedBatches.reduce(
-        (sum, b) => sum + b.currentQty,
-        0,
-      );
+      const stocked = stockedBatches.reduce((sum, b) => sum + b.currentQty, 0);
 
       // Sold: sum of 'sale' transactions in this month (only approved sales)
       const soldAgg = await this.prisma.transaction.aggregate({
@@ -816,7 +1013,7 @@ export class AnalyticsService {
             mode: 'insensitive',
           },
           status: 'approved',
-          transactionDate: { gte: m.start, lt: m.end },
+          transactionDate: { gte: m.start, lte: m.end },
         },
       });
       points.push({
@@ -887,9 +1084,8 @@ export class AnalyticsService {
     });
     return batches.map((b) => {
       // Get location names (comma-separated if multiple)
-      const locationNames = b.locationBatches
-        .map((lb) => lb.location.name)
-        .join(', ') || undefined;
+      const locationNames =
+        b.locationBatches.map((lb) => lb.location.name).join(', ') || undefined;
 
       return {
         genericName: b.drug.tradeName ?? b.drug.genericName,
@@ -934,9 +1130,8 @@ export class AnalyticsService {
     });
     return batches.map((b) => {
       // Get location names (comma-separated if multiple)
-      const locationNames = b.locationBatches
-        .map((lb) => lb.location.name)
-        .join(', ') || undefined;
+      const locationNames =
+        b.locationBatches.map((lb) => lb.location.name).join(', ') || undefined;
 
       return {
         genericName: b.drug.tradeName ?? b.drug.genericName,
@@ -984,9 +1179,8 @@ export class AnalyticsService {
     });
     return batches.map((b) => {
       // Get location names (comma-separated if multiple)
-      const locationNames = b.locationBatches
-        .map((lb) => lb.location.name)
-        .join(', ') || undefined;
+      const locationNames =
+        b.locationBatches.map((lb) => lb.location.name).join(', ') || undefined;
 
       return {
         genericName: b.drug.tradeName ?? b.drug.genericName,
@@ -1049,9 +1243,8 @@ export class AnalyticsService {
 
     return paginated.map((b) => {
       // Get location names (comma-separated if multiple)
-      const locationNames = b.locationBatches
-        .map((lb) => lb.location.name)
-        .join(', ') || undefined;
+      const locationNames =
+        b.locationBatches.map((lb) => lb.location.name).join(', ') || undefined;
 
       return {
         genericName: b.drug.tradeName ?? b.drug.genericName,
@@ -1084,7 +1277,7 @@ export class AnalyticsService {
           mode: 'insensitive',
         },
         status: 'approved',
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
       orderBy: { _sum: { quantity: 'desc' } },
       take: limit + offset,
@@ -1106,9 +1299,9 @@ export class AnalyticsService {
         // Use batch.currentQty instead of locationBatches.quantity
         const currentQty = batch.currentQty;
         // Get location names (comma-separated if multiple)
-        const locationNames = batch.locationBatches
-          .map((lb) => lb.location.name)
-          .join(', ') || undefined;
+        const locationNames =
+          batch.locationBatches.map((lb) => lb.location.name).join(', ') ||
+          undefined;
 
         return {
           genericName: batch.drug.tradeName ?? batch.drug.genericName,
@@ -1120,7 +1313,8 @@ export class AnalyticsService {
           quantity: currentQty,
           location: locationNames,
           unitPrice: batch.unitCost,
-          lastRestock: batch.purchaseDate?.toISOString().split('T')[0] || undefined,
+          lastRestock:
+            batch.purchaseDate?.toISOString().split('T')[0] || undefined,
           supplier: batch.supplier.name,
           orderedQty: r._sum.quantity || 0,
         };
@@ -1159,7 +1353,7 @@ export class AnalyticsService {
           mode: 'insensitive',
         },
         status: 'approved',
-        transactionDate: { gte: start, lt: end },
+        transactionDate: { gte: start, lte: end },
       },
     });
 
@@ -1190,9 +1384,9 @@ export class AnalyticsService {
 
     return sortedBatches.map(({ batch, soldQty }) => {
       // Get location names (comma-separated if multiple)
-      const locationNames = batch.locationBatches
-        .map((lb) => lb.location.name)
-        .join(', ') || undefined;
+      const locationNames =
+        batch.locationBatches.map((lb) => lb.location.name).join(', ') ||
+        undefined;
 
       return {
         genericName: batch.drug.tradeName ?? batch.drug.genericName,
@@ -1203,7 +1397,8 @@ export class AnalyticsService {
         quantity: batch.currentQty, // Use batch.currentQty for consistency
         location: locationNames,
         unitPrice: batch.unitCost,
-        lastRestock: batch.purchaseDate?.toISOString().split('T')[0] || undefined,
+        lastRestock:
+          batch.purchaseDate?.toISOString().split('T')[0] || undefined,
         supplier: batch.supplier.name,
         orderedQty: soldQty, // This is the sales quantity (soldQty)
       };
@@ -1290,7 +1485,11 @@ export class AnalyticsService {
     const totalItemsCurrent = await this.totalItems();
     // Expired and expiring items use current date (not time-filtered)
     const expiredItemsCurrent = await this.expiredBatchesCount();
-    const expiring30Current = await this.expiringInDays(30);
+    const expiryWarningDays = await this.configStore.getNumber(
+      'expiry_warning_days',
+      30,
+    );
+    const expiring30Current = await this.expiringInDays(expiryWarningDays);
     const lowStockCurrent = await this.lowStockCount();
     const delayedPoCurrent = await this.delayedPurchaseOrders();
     const outOfStockCurrent = await this.outOfStockCount();
@@ -1387,7 +1586,7 @@ export class AnalyticsService {
     const expiredProducts = await this.expiredProducts(tableLimit, 0);
     // Uses current date (not time-filtered) to match card calculation
     const soonToExpireProducts = await this.soonToExpireProducts(
-      30,
+      expiryWarningDays,
       tableLimit,
       0,
     );
@@ -1414,14 +1613,18 @@ export class AnalyticsService {
     // Calculate supply cards metrics
     const activeSuppliersCount = await this.activeSuppliersCount(180); // Last 180 days
     const totalPurchasesETB = await this.totalPurchasesETB();
-    const topSuppliersList = await this.topSuppliers(1, TopSuppliersSort.Volume, SortOrder.Desc)
-    const topSupplierName = topSuppliersList.length > 0
-      ? topSuppliersList[0].name
-      : 'None';
+    const topSuppliersList = await this.topSuppliers(
+      1,
+      TopSuppliersSort.Volume,
+      SortOrder.Desc,
+    );
+    const topSupplierName =
+      topSuppliersList.length > 0 ? topSuppliersList[0].name : 'None';
     const onTimeDeliveryRate = await this.onTimeDeliveryRate();
-    const mostOrderedProductForSupply = mostOrderedProducts.length > 0
-      ? `${mostOrderedProducts[0].tradeName ?? mostOrderedProducts[0].genericName} (${mostOrderedProducts[0].orderedQty})`
-      : 'None';
+    const mostOrderedProductForSupply =
+      mostOrderedProducts.length > 0
+        ? `${mostOrderedProducts[0].tradeName ?? mostOrderedProducts[0].genericName} (${mostOrderedProducts[0].orderedQty})`
+        : 'None';
 
     const metrics: KeyMetric[] = [
       {
@@ -1460,7 +1663,7 @@ export class AnalyticsService {
         trendUp: totalStockValueTrendUp,
       },
       {
-        label: 'Expiring in 30 days',
+        label: `Expiring in ${expiryWarningDays} days`,
         value: expiring30Current,
         trendUp: true,
       },
@@ -1493,7 +1696,7 @@ export class AnalyticsService {
         trendUp: expiredItemsTrendUp,
       },
       {
-        label: 'Expiring in 30 days',
+        label: `Expiring in ${expiryWarningDays} days`,
         value: expiring30Current,
         trendUp: true,
       },
@@ -1535,40 +1738,55 @@ export class AnalyticsService {
     ];
 
     // Sales tab cards
-    const fastestMovingProduct = fastMovingProducts.length > 0
-      ? `${fastMovingProducts[0].tradeName ?? fastMovingProducts[0].genericName} (${fastMovingProducts[0].orderedQty})`
-      : 'None';
-    
-    const topSellingProduct = mostSoldRows.length > 0
-      ? `${mostSoldRows[0].drugName} (${mostSoldRows[0].soldQty})`
-      : 'None';
-    
-    const worstPerformingProduct = slowMovingProducts.length > 0
-      ? `${slowMovingProducts[0].tradeName ?? slowMovingProducts[0].genericName} (${slowMovingProducts[0].orderedQty})`
-      : 'None';
+    const fastestMovingProduct =
+      fastMovingProducts.length > 0
+        ? `${fastMovingProducts[0].tradeName ?? fastMovingProducts[0].genericName} (${fastMovingProducts[0].orderedQty})`
+        : 'None';
+
+    const topSellingProduct =
+      mostSoldRows.length > 0
+        ? `${mostSoldRows[0].drugName} (${mostSoldRows[0].soldQty})`
+        : 'None';
+
+    const worstPerformingProduct =
+      slowMovingProducts.length > 0
+        ? `${slowMovingProducts[0].tradeName ?? slowMovingProducts[0].genericName} (${slowMovingProducts[0].orderedQty})`
+        : 'None';
 
     // Find top-selling category (highest soldQty)
-    const topSellingCategory = distribution.length > 0
-      ? distribution.reduce((top, current) => 
-          current.soldQty > top.soldQty ? current : top
-        )
-      : null;
+    const topSellingCategory =
+      distribution.length > 0
+        ? distribution.reduce((top, current) =>
+            current.soldQty > top.soldQty ? current : top,
+          )
+        : null;
     const topCategoryValue = topSellingCategory
       ? `${topSellingCategory.category} (${topSellingCategory.soldQty})`
       : 'None';
 
     // Find month that sold the most from yearly sales data
-    const topSellingMonth = yearlySales.length > 0
-      ? yearlySales.reduce((top, current) => 
-          current.sales > top.sales ? current : top
-        )
-      : null;
-    
+    const topSellingMonth =
+      yearlySales.length > 0
+        ? yearlySales.reduce((top, current) =>
+            current.sales > top.sales ? current : top,
+          )
+        : null;
+
     // Convert YYYY-MM format to month name
     const getMonthName = (monthStr: string): string => {
       const monthNames = [
-        'January', 'February', 'March', 'April', 'May', 'June',
-        'July', 'August', 'September', 'October', 'November', 'December'
+        'January',
+        'February',
+        'March',
+        'April',
+        'May',
+        'June',
+        'July',
+        'August',
+        'September',
+        'October',
+        'November',
+        'December',
       ];
       const parts = monthStr.split('-');
       if (parts.length === 2) {
@@ -1579,7 +1797,7 @@ export class AnalyticsService {
       }
       return monthStr; // Fallback to original format if parsing fails
     };
-    
+
     const topMonthValue = topSellingMonth
       ? `${getMonthName(topSellingMonth.month)} (${topSellingMonth.sales})`
       : 'None';
@@ -1593,7 +1811,8 @@ export class AnalyticsService {
       {
         label: 'Fastest moving product',
         value: fastestMovingProduct,
-        trendUp: fastMovingProducts.length > 0 && fastMovingProducts[0].orderedQty > 0,
+        trendUp:
+          fastMovingProducts.length > 0 && fastMovingProducts[0].orderedQty > 0,
       },
       {
         label: 'Top-selling product',
@@ -1603,7 +1822,9 @@ export class AnalyticsService {
       {
         label: 'Worst-performing product',
         value: worstPerformingProduct,
-        trendUp: slowMovingProducts.length > 0 && slowMovingProducts[0].orderedQty === 0,
+        trendUp:
+          slowMovingProducts.length > 0 &&
+          slowMovingProducts[0].orderedQty === 0,
       },
       {
         label: 'Total Sales Revenue',
@@ -1662,7 +1883,9 @@ export class AnalyticsService {
       {
         label: 'Most ordered product',
         value: mostOrderedProductForSupply,
-        trendUp: mostOrderedProducts.length > 0 && mostOrderedProducts[0].orderedQty > 0,
+        trendUp:
+          mostOrderedProducts.length > 0 &&
+          mostOrderedProducts[0].orderedQty > 0,
       },
     ];
 

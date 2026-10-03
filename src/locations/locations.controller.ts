@@ -9,6 +9,7 @@ import {
   Query,
   UseGuards,
   ParseIntPipe,
+  DefaultValuePipe,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -101,6 +102,19 @@ export class LocationsController {
   })
   remove(@Param('id', ParseIntPipe) id: number): Promise<Location> {
     return this.locationsService.remove(id);
+  }
+
+  @Get(':id/batches')
+  @Roles('ADMIN', 'MANAGER', 'PHARMACIST', 'SELLER')
+  @ApiOperation({ summary: 'List batches stored at a location' })
+  @ApiResponse({ status: 200, description: 'Batches retrieved successfully' })
+  @ApiResponse({ status: 404, description: 'Location not found' })
+  getBatches(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
+    @Query('limit', new DefaultValuePipe(10), ParseIntPipe) limit: number,
+  ) {
+    return this.locationsService.findBatches(id, page, limit);
   }
 
   @Get('batch/:batchId')

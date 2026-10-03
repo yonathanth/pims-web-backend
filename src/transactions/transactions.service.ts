@@ -17,6 +17,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { Audit } from '../audit-log/audit.decorator';
 import { RequestContextService } from '../common/request-context.service';
+import { ExpiryOrderService } from '../sales/expiry-order.service';
 
 @Injectable({ scope: Scope.REQUEST })
 export class TransactionsService {
@@ -25,6 +26,7 @@ export class TransactionsService {
     private notificationsService: NotificationsService,
     private auditLogService: AuditLogService,
     private requestContext: RequestContextService,
+    private expiryOrderService: ExpiryOrderService,
   ) {}
 
   getCurrentUserId(): number | null {
@@ -58,6 +60,18 @@ export class TransactionsService {
       throw new BadRequestException(
         `Insufficient quantity. Available: ${batch.currentQty}, Requested: ${dto.quantity}`,
       );
+    }
+
+    // Same soonest-expiry-first rule as grouped sales (POST /sales)
+    if (isSale) {
+      const expiryCheck = await this.expiryOrderService.check([
+        { batchId: dto.batchId, quantity: dto.quantity },
+      ]);
+      if (expiryCheck.policy === 'block' && expiryCheck.conflicts.length > 0) {
+        throw new BadRequestException(
+          `Sell from the batches that expire sooner first. ${this.expiryOrderService.describe(expiryCheck.conflicts)}`,
+        );
+      }
     }
 
     const result = await this.prisma.$transaction(async (tx) => {

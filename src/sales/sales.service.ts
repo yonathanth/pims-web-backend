@@ -15,6 +15,8 @@ import {
 import { TransactionType } from '../transactions/dto/create-transaction.dto';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { ExpiryOrderService } from './expiry-order.service';
+import { SalePushService } from './sale-push.service';
 
 @Injectable()
 export class SalesService {
@@ -22,7 +24,14 @@ export class SalesService {
     private readonly prisma: PrismaService,
     private readonly auditLogService: AuditLogService,
     private readonly notificationsService: NotificationsService,
+    private readonly expiryOrderService: ExpiryOrderService,
+    private readonly salePushService: SalePushService,
   ) {}
+
+  // Lets the UI warn before submitting; createGroupedSale enforces 'block' itself
+  checkExpiryOrder(items: { batchId: number; quantity: number }[]) {
+    return this.expiryOrderService.check(items);
+  }
 
   async getPendingSales() {
     try {
@@ -58,7 +67,9 @@ export class SalesService {
         category: transaction.batch.drug.category.name,
         quantity: transaction.quantity,
         unitPrice: transaction.unitPrice ?? transaction.batch.unitPrice,
-        totalPrice: transaction.quantity * (transaction.unitPrice ?? transaction.batch.unitPrice),
+        totalPrice:
+          transaction.quantity *
+          (transaction.unitPrice ?? transaction.batch.unitPrice),
         customerName:
           transaction.user?.fullName ||
           transaction.user?.username ||
@@ -157,7 +168,9 @@ export class SalesService {
         category: transaction.batch.drug.category.name,
         quantity: transaction.quantity,
         unitPrice: transaction.unitPrice ?? transaction.batch.unitPrice,
-        totalPrice: transaction.quantity * (transaction.unitPrice ?? transaction.batch.unitPrice),
+        totalPrice:
+          transaction.quantity *
+          (transaction.unitPrice ?? transaction.batch.unitPrice),
         customerName:
           transaction.user?.fullName ||
           transaction.user?.username ||
@@ -206,16 +219,10 @@ export class SalesService {
       );
     }
 
-    // First create the sale header
-    const sale = await this.prisma.sale.create({
-      data: {
-        status: 'pending',
-        notes: dto.notes,
-      },
-    });
-
-    // Then process each line item individually
+    // Validate every line before writing anything, so a bad line can't
+    // leave an empty sale header behind.
     // Only validate availability - don't deduct inventory until approval
+    const batches = new Map<number, { unitPrice: number }>();
     for (const item of dto.items) {
       const batch = await this.prisma.batch.findUnique({
         where: { id: item.batchId },
@@ -231,6 +238,28 @@ export class SalesService {
           `Insufficient quantity for batch ${item.batchId}. Available: ${batch.currentQty}, Requested: ${item.quantity}`,
         );
       }
+      batches.set(batch.id, { unitPrice: batch.unitPrice });
+    }
+
+    // Enforce selling the soonest-expiring batch first when the admin set 'block'
+    const expiryCheck = await this.expiryOrderService.check(dto.items);
+    if (expiryCheck.policy === 'block' && expiryCheck.conflicts.length > 0) {
+      throw new BadRequestException(
+        `Sell from the batches that expire sooner first. ${this.expiryOrderService.describe(expiryCheck.conflicts)}`,
+      );
+    }
+
+    // First create the sale header
+    const sale = await this.prisma.sale.create({
+      data: {
+        status: 'pending',
+        notes: dto.notes,
+      },
+    });
+
+    // Then process each line item individually
+    for (const item of dto.items) {
+      const batch = batches.get(item.batchId)!;
 
       // Create transaction record without deducting inventory
       await this.prisma.transaction.create({
@@ -300,17 +329,30 @@ export class SalesService {
 
         // Update transaction status
         return await tx.transaction.update({
-        where: { id },
-        data: {
-          status: 'approved',
-          notes: approveSaleDto.notes || transaction.notes,
-          updatedAt: new Date(),
-        },
-      });
+          where: { id },
+          data: {
+            status: 'approved',
+            notes: approveSaleDto.notes || transaction.notes,
+            updatedAt: new Date(),
+          },
+        });
       });
 
       // Evaluate stock notifications after inventory deduction
       await this.notificationsService.evaluateBatchStock(transaction.batchId);
+
+      // Push to the owner's devices via the cloud; never blocks the sale
+      if (transaction.saleId) {
+        // Last pending line of a group: the whole sale is now complete
+        const stillPending = await this.prisma.transaction.count({
+          where: { saleId: transaction.saleId, status: 'pending' },
+        });
+        if (stillPending === 0) {
+          this.salePushService.notifySaleGroupApproved(transaction.saleId);
+        }
+      } else {
+        this.salePushService.notifyTransactionApproved(id);
+      }
 
       return {
         message: 'Sale approved successfully',
@@ -431,12 +473,12 @@ export class SalesService {
         // Update transaction status
         await tx.transaction.update({
           where: { id: transaction.id },
-        data: {
-          status: 'approved',
-          ...(notesToApply && { notes: notesToApply }),
-          updatedAt: new Date(),
-        },
-      });
+          data: {
+            status: 'approved',
+            ...(notesToApply && { notes: notesToApply }),
+            updatedAt: new Date(),
+          },
+        });
       }
 
       // Update sale header
@@ -464,6 +506,9 @@ export class SalesService {
       userId,
       changeSummary: 'Approved sale group',
     });
+
+    // Push to the owner's devices via the cloud; never blocks the sale
+    this.salePushService.notifySaleGroupApproved(saleId);
 
     return {
       message: 'Sale group approved successfully',
@@ -544,7 +589,23 @@ export class SalesService {
     };
   }
 
-  private getDateRange(period: PeriodType, startDate?: string, endDate?: string): { start: Date; end: Date } {
+  // "YYYY-MM-DD" is parsed as a local calendar day; new Date() would treat it as UTC midnight
+  private parseLocalDate(value: string): Date {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    const date = match
+      ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
+      : new Date(value);
+    if (isNaN(date.getTime())) {
+      throw new BadRequestException(`Invalid date: ${value}`);
+    }
+    return date;
+  }
+
+  private getDateRange(
+    period: PeriodType,
+    startDate?: string,
+    endDate?: string,
+  ): { start: Date; end: Date } {
     const now = new Date();
     let start: Date;
     let end: Date = new Date(now);
@@ -577,12 +638,19 @@ export class SalesService {
         break;
       case PeriodType.CUSTOM:
         if (!startDate || !endDate) {
-          throw new BadRequestException('Start date and end date are required for custom period');
+          throw new BadRequestException(
+            'Start date and end date are required for custom period',
+          );
         }
-        start = new Date(startDate);
+        start = this.parseLocalDate(startDate);
         start.setHours(0, 0, 0, 0);
-        end = new Date(endDate);
+        end = this.parseLocalDate(endDate);
         end.setHours(23, 59, 59, 999);
+        if (start > end) {
+          throw new BadRequestException(
+            'Start date must be on or before end date',
+          );
+        }
         break;
       default:
         start = new Date(now);
@@ -595,7 +663,13 @@ export class SalesService {
 
   async getProductSales(query: ProductSalesQueryDto) {
     try {
-      const { period = PeriodType.DAILY, startDate, endDate, page = 1, limit = 10 } = query;
+      const {
+        period = PeriodType.DAILY,
+        startDate,
+        endDate,
+        page = 1,
+        limit = 10,
+      } = query;
       const skip = (page - 1) * limit;
 
       // Get date range based on period
@@ -633,11 +707,14 @@ export class SalesService {
 
       // Group transactions by product (drugId)
       // First, collect all unique drugs to ensure consistent naming
-      const drugInfoMap = new Map<number, {
-        drugName: string;
-        sku: string;
-        category: string;
-      }>();
+      const drugInfoMap = new Map<
+        number,
+        {
+          drugName: string;
+          sku: string;
+          category: string;
+        }
+      >();
 
       approvedTransactions.forEach((t) => {
         const drugId = t.batch.drug.id;
@@ -653,28 +730,31 @@ export class SalesService {
       });
 
       // Now group transactions by product (drugId)
-      const productMap = new Map<number, {
-        drugId: number;
-        drugName: string;
-        sku: string;
-        category: string;
-        totalQuantity: number;
-        totalRevenue: number;
-        totalProfit: number;
-        unitPrice: number;
-      }>();
+      const productMap = new Map<
+        number,
+        {
+          drugId: number;
+          drugName: string;
+          sku: string;
+          category: string;
+          totalQuantity: number;
+          totalRevenue: number;
+          totalProfit: number;
+          unitPrice: number;
+        }
+      >();
 
       approvedTransactions.forEach((t) => {
         const drugId = t.batch.drug.id;
         const drugInfo = drugInfoMap.get(drugId)!;
-        
+
         // Use transaction unitPrice if available, otherwise fall back to batch unitPrice
         const unitPrice = t.unitPrice ?? t.batch.unitPrice ?? 0;
         const unitCost = t.batch.unitCost || 0;
-        
+
         // Calculate revenue and profit for this transaction
         const revenue = t.quantity * unitPrice;
-        const profit = revenue - (t.quantity * unitCost);
+        const profit = revenue - t.quantity * unitCost;
 
         if (productMap.has(drugId)) {
           const existing = productMap.get(drugId)!;
@@ -700,9 +780,10 @@ export class SalesService {
         .map((product) => ({
           ...product,
           // Calculate weighted average unit price: totalRevenue / totalQuantity
-          unitPrice: product.totalQuantity > 0 
-            ? product.totalRevenue / product.totalQuantity 
-            : 0,
+          unitPrice:
+            product.totalQuantity > 0
+              ? product.totalRevenue / product.totalQuantity
+              : 0,
         }))
         .sort((a, b) => {
           // Primary sort: total quantity (descending)
@@ -719,15 +800,9 @@ export class SalesService {
         0,
       );
 
-      const totalRevenue = products.reduce(
-        (sum, p) => sum + p.totalRevenue,
-        0,
-      );
+      const totalRevenue = products.reduce((sum, p) => sum + p.totalRevenue, 0);
 
-      const totalProfit = products.reduce(
-        (sum, p) => sum + p.totalProfit,
-        0,
-      );
+      const totalProfit = products.reduce((sum, p) => sum + p.totalProfit, 0);
 
       // Get most sold item (should be products[0] after sorting by quantity descending)
       const mostSoldItem = products.length > 0 ? products[0].drugName : 'N/A';
@@ -748,8 +823,14 @@ export class SalesService {
           page: page,
           skip: skip,
           limit: limit,
-          firstProductInResults: paginatedProducts.length > 0 ? paginatedProducts[0].drugName : 'N/A',
-          allProductNames: products.map(p => ({ name: p.drugName, qty: p.totalQuantity })),
+          firstProductInResults:
+            paginatedProducts.length > 0
+              ? paginatedProducts[0].drugName
+              : 'N/A',
+          allProductNames: products.map((p) => ({
+            name: p.drugName,
+            qty: p.totalQuantity,
+          })),
         });
       }
 

@@ -172,6 +172,73 @@ export class LocationsService {
     }
   }
 
+  // Batches stored at a location, with the quantity held at this location
+  async findBatches(id: number, page = 1, limit = 10) {
+    page = Math.max(1, page);
+    limit = Math.min(100, Math.max(1, limit));
+    const location = await this.prisma.location.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    if (!location) {
+      throw new NotFoundException(`Location with ID ${id} not found`);
+    }
+
+    const where = { locationId: id };
+    const [totalItems, rows] = await this.prisma.$transaction([
+      this.prisma.locationBatch.count({ where }),
+      this.prisma.locationBatch.findMany({
+        where,
+        // id breaks ties so pages stay stable when expiry dates are equal
+        orderBy: [{ batch: { expiryDate: 'asc' } }, { id: 'asc' }],
+        skip: (page - 1) * limit,
+        take: limit,
+        select: {
+          quantity: true,
+          batch: {
+            select: {
+              id: true,
+              batchNumber: true,
+              expiryDate: true,
+              currentQty: true,
+              drug: {
+                select: {
+                  sku: true,
+                  genericName: true,
+                  tradeName: true,
+                  strength: true,
+                },
+              },
+            },
+          },
+        },
+      }),
+    ]);
+
+    const data = rows.map(({ quantity, batch }) => ({
+      batchId: batch.id,
+      batchNumber: batch.batchNumber,
+      sku: batch.drug.sku,
+      drugName: batch.drug.tradeName?.trim()
+        ? `${batch.drug.genericName} (${batch.drug.tradeName})`
+        : batch.drug.genericName,
+      strength: batch.drug.strength,
+      quantity,
+      totalQty: batch.currentQty,
+      expiryDate: batch.expiryDate,
+    }));
+
+    return {
+      data,
+      meta: {
+        page,
+        limit,
+        totalItems,
+        totalPages: Math.max(1, Math.ceil(totalItems / limit)),
+      },
+    };
+  }
+
   async findByBatch(batchId: number): Promise<Location[]> {
     // Ensure batch exists
     const batch = await this.prisma.batch.findUnique({

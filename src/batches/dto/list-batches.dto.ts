@@ -96,6 +96,7 @@ export class ListBatchesDto {
       'Low Stock',
       'Expired',
       'Near-Expiry',
+      'Sellable',
     ],
     description: 'Filter by stock status',
   })
@@ -107,6 +108,7 @@ export class ListBatchesDto {
     'Low Stock',
     'Expired',
     'Near-Expiry',
+    'Sellable',
   ])
   stockStatus?:
     | 'All'
@@ -114,7 +116,8 @@ export class ListBatchesDto {
     | 'Out of Stock'
     | 'Low Stock'
     | 'Expired'
-    | 'Near-Expiry' = 'All';
+    | 'Near-Expiry'
+    | 'Sellable' = 'All';
 
   @ApiPropertyOptional({ enum: ['asc', 'desc'] })
   @IsOptional()

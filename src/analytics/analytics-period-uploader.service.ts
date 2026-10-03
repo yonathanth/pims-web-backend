@@ -1,11 +1,18 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnApplicationBootstrap,
+  OnModuleInit,
+} from '@nestjs/common';
+import { ContextIdFactory, ModuleRef } from '@nestjs/core';
 import { Cron } from '@nestjs/schedule';
 import axios from 'axios';
 import { gzip } from 'zlib';
 import { promisify } from 'util';
 import { AnalyticsService } from './analytics.service';
 import { SalesService } from '../sales/sales.service';
-import { GeneralConfigsService } from '../general-configs/general-configs.service';
+import { ConfigStoreService } from '../general-configs/config-store.service';
+import { isAutoSyncEnabled } from '../common/cloud-sync';
 import {
   AnalyticsResponse,
   KeyMetric,
@@ -19,6 +26,11 @@ import { PeriodType } from '../sales/dto/product-sales-query.dto';
 const gzipAsync = promisify(gzip);
 
 type Period = 'daily' | 'weekly' | 'monthly' | 'yearly';
+const ALL_PERIODS: Period[] = ['daily', 'weekly', 'monthly', 'yearly'];
+
+// Rolling window and size of the period-independent fast/slow mover lists
+const MOVING_WINDOW_DAYS = 30;
+const MOVING_LIST_LIMIT = 10;
 
 type PeriodSyncResult = {
   period: Period;
@@ -28,60 +40,102 @@ type PeriodSyncResult = {
   error?: string;
 };
 
+/**
+ * Uploads analytics snapshots to the cloud API on a schedule.
+ *
+ * Must stay a singleton: it used to inject request-scoped services, which made
+ * it request-scoped too, so Nest never ran its @Cron jobs or onModuleInit and
+ * uploads only happened when someone pressed the upload button.
+ */
 @Injectable()
-export class AnalyticsPeriodUploaderService implements OnModuleInit {
+export class AnalyticsPeriodUploaderService
+  implements OnModuleInit, OnApplicationBootstrap
+{
   private readonly logger = new Logger(AnalyticsPeriodUploaderService.name);
   private previousHashes: Map<string, string> = new Map();
   private running = false;
+  // Guards a whole sync run, so overlapping schedules don't upload twice
+  private syncing = false;
   private lastSuccessAt: string | null = null;
-  private readonly CONFIG_KEY_LAST_SUCCESS = 'analytics_period_upload_last_success_at';
+  private readonly CONFIG_KEY_LAST_SUCCESS =
+    'analytics_period_upload_last_success_at';
 
   constructor(
     private readonly analyticsService: AnalyticsService,
-    private readonly salesService: SalesService,
-    private readonly generalConfigs: GeneralConfigsService,
+    private readonly configStore: ConfigStoreService,
+    private readonly moduleRef: ModuleRef,
   ) {}
 
   async onModuleInit() {
     // Load persisted hashes and lastSuccessAt from database
     try {
-      const periods: Period[] = ['daily', 'weekly', 'monthly', 'yearly'];
-      for (const period of periods) {
+      for (const period of ALL_PERIODS) {
         const hashKey = `period_upload_hash_${period}`;
-        const hashConfig = await this.generalConfigs
-          .getTypedValue<string>(hashKey, 'string')
+        const hashConfig = await this.configStore
+          .getString(hashKey)
           .catch(() => null);
 
         if (hashConfig) {
           this.previousHashes.set(period, hashConfig);
-          this.logger.debug(`Loaded persisted hash for ${period}: ${hashConfig}`);
+          this.logger.debug(
+            `Loaded persisted hash for ${period}: ${hashConfig}`,
+          );
         }
       }
 
       // Load lastSuccessAt
-      const lastSuccessConfig = await this.generalConfigs
-        .getTypedValue<string>(this.CONFIG_KEY_LAST_SUCCESS, 'string')
+      const lastSuccessConfig = await this.configStore
+        .getString(this.CONFIG_KEY_LAST_SUCCESS)
         .catch(() => null);
 
       if (lastSuccessConfig) {
         this.lastSuccessAt = lastSuccessConfig;
-        this.logger.log(`✅ Period uploader: Loaded persisted lastSuccessAt from database: ${lastSuccessConfig}`);
+        this.logger.log(
+          `✅ Period uploader: Loaded persisted lastSuccessAt from database: ${lastSuccessConfig}`,
+        );
       } else {
-        this.logger.warn(`⚠️ Period uploader: No persisted lastSuccessAt found in database (key: ${this.CONFIG_KEY_LAST_SUCCESS}). This means no successful upload has occurred yet.`);
+        this.logger.warn(
+          `⚠️ Period uploader: No persisted lastSuccessAt found in database (key: ${this.CONFIG_KEY_LAST_SUCCESS}). This means no successful upload has occurred yet.`,
+        );
       }
     } catch (error) {
       this.logger.warn('Failed to load persisted upload data:', error);
     }
   }
 
-  // Sync every 6 hours
-  @Cron('0 */6 * * *')
-  async syncAllPeriodsScheduled() {
-    await this.syncAllPeriods(false);
+  // Upload once at startup without delaying it
+  onApplicationBootstrap() {
+    if (!isAutoSyncEnabled()) {
+      this.logger.log(
+        'Automatic cloud sync is off (REMOTE_ANALYTICS_AUTO_SYNC=false)',
+      );
+      return;
+    }
+    void this.syncAllPeriods(false).catch((e) =>
+      this.logger.warn(`Startup sync failed: ${e?.message || e}`),
+    );
   }
 
-  async syncAllPeriods(force = false): Promise<PeriodSyncResult[]> {
-    if (this.running) {
+  // Today's numbers (sales so far, stock lists) every 10 minutes; unchanged
+  // data is skipped by the hash check, so quiet periods send nothing
+  @Cron('*/10 * * * *')
+  async syncDailyScheduled() {
+    if (!isAutoSyncEnabled()) return;
+    await this.syncAllPeriods(false, ['daily']);
+  }
+
+  // Longer periods change slowly; every 6 hours (offset from the daily run)
+  @Cron('5 */6 * * *')
+  async syncAllPeriodsScheduled() {
+    if (!isAutoSyncEnabled()) return;
+    await this.syncAllPeriods(false, ['weekly', 'monthly', 'yearly']);
+  }
+
+  async syncAllPeriods(
+    force = false,
+    periods: Period[] = ALL_PERIODS,
+  ): Promise<PeriodSyncResult[]> {
+    if (this.syncing || this.running) {
       this.logger.debug('Previous sync still running, skipping this attempt');
       return [
         {
@@ -92,8 +146,25 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
       ];
     }
 
-    const periods: Period[] = ['daily', 'weekly', 'monthly', 'yearly'];
+    this.syncing = true;
+    try {
+      return await this.runSync(force, periods);
+    } finally {
+      this.syncing = false;
+    }
+  }
+
+  private async runSync(
+    force: boolean,
+    periods: Period[],
+  ): Promise<PeriodSyncResult[]> {
     const results: PeriodSyncResult[] = [];
+
+    // Same for every period, so compute once per run
+    const moving = await this.analyticsService.movingProductsByDrug(
+      MOVING_WINDOW_DAYS,
+      MOVING_LIST_LIMIT,
+    );
 
     for (const period of periods) {
       try {
@@ -110,6 +181,7 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
           period,
           analytics,
           sales,
+          moving,
           force,
         );
         results.push({ period, ...result });
@@ -127,7 +199,9 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
     return results;
   }
 
-  private async fetchAnalyticsForPeriod(period: Period): Promise<AnalyticsResponse> {
+  private async fetchAnalyticsForPeriod(
+    period: Period,
+  ): Promise<AnalyticsResponse> {
     const today = new Date();
     let timeFilter: TimeFilter;
     let startIso: string | undefined;
@@ -144,7 +218,8 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
         timeFilter = TimeFilter.Custom;
         const weekStart = new Date(today);
         const dayOfWeek = weekStart.getDay();
-        const diff = weekStart.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1); // Monday
+        const diff =
+          weekStart.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1); // Monday
         weekStart.setDate(diff);
         weekStart.setHours(0, 0, 0, 0);
         // End is Sunday of current week (end of today, which is already in the current week)
@@ -201,8 +276,16 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
         break;
     }
 
+    // SalesService is request-scoped (through NotificationsService), so
+    // resolve a fresh instance with an empty request outside of HTTP calls
+    const contextId = ContextIdFactory.create();
+    this.moduleRef.registerRequestByContextId({ user: undefined }, contextId);
+    const salesService = await this.moduleRef.resolve(SalesService, contextId, {
+      strict: false,
+    });
+
     // Always limit to top 10 for all periods
-    const result = await this.salesService.getProductSales({
+    const result = await salesService.getProductSales({
       period: periodType,
       page: 1,
       limit: 10,
@@ -215,6 +298,7 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
     period: Period,
     analytics: AnalyticsResponse,
     sales: any,
+    moving: { fast: ProductDto[]; slow: ProductDto[] },
     force: boolean,
   ): Promise<Omit<PeriodSyncResult, 'period'>> {
     const baseUrl = process.env.REMOTE_ANALYTICS_BASE_URL;
@@ -224,7 +308,8 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
     if (!baseUrl || !apiKey || !pharmacyId) {
       return {
         outcome: 'disabled',
-        message: 'Missing remote analytics configuration (BASE_URL/API_KEY/PHARMACY_ID)',
+        message:
+          'Missing remote analytics configuration (BASE_URL/API_KEY/PHARMACY_ID)',
       };
     }
 
@@ -234,7 +319,13 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
       // Create data payload (without timestamp for hash calculation)
       const dataPayload = {
         period,
-        analytics: this.mapAnalyticsPayload(analytics),
+        analytics: {
+          ...this.mapAnalyticsPayload(analytics),
+          // Period-independent: last 30 days, combined per product
+          moving_window_days: MOVING_WINDOW_DAYS,
+          fast_moving_products_30d: moving.fast.map(this.mapProduct),
+          slow_moving_products_30d: moving.slow.map(this.mapProduct),
+        },
         sales: this.mapSalesPayload(sales, period),
       };
 
@@ -252,7 +343,9 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
 
       // Check if changed
       if (!force && this.previousHashes.get(hashKey) === hash) {
-        this.logger.debug(`No changes detected for ${period} period; skipping upload`);
+        this.logger.debug(
+          `No changes detected for ${period} period; skipping upload`,
+        );
         // IMPORTANT: Even when skipping, we should preserve the existing lastSuccessAt
         // Don't update it, but also don't clear it - it should show the last successful upload time
         return {
@@ -266,7 +359,10 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
       const compressed = await gzipAsync(Buffer.from(jsonWithHash, 'utf8'));
       const originalSize = Buffer.byteLength(jsonWithHash, 'utf8');
       const compressedSize = compressed.length;
-      const compressionRatio = ((1 - compressedSize / originalSize) * 100).toFixed(1);
+      const compressionRatio = (
+        (1 - compressedSize / originalSize) *
+        100
+      ).toFixed(1);
 
       this.logger.debug(
         `Payload size for ${period}: ${originalSize} bytes → ${compressedSize} bytes (${compressionRatio}% reduction)`,
@@ -274,10 +370,14 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
 
       // Upload to cloud API
       const url = `${baseUrl.replace(/\/$/, '')}/api/sync/period/${encodeURIComponent(pharmacyId)}/${period}`;
-      
+
       this.logger.log(`🚀 Uploading ${period} data to: ${url}`);
-      this.logger.log(`📦 Payload size: ${compressed.length} bytes (compressed)`);
-      this.logger.log(`🔑 Using API key: ${apiKey ? apiKey.substring(0, 10) + '...' : 'MISSING'}`);
+      this.logger.log(
+        `📦 Payload size: ${compressed.length} bytes (compressed)`,
+      );
+      this.logger.log(
+        `🔑 Using API key: ${apiKey ? apiKey.substring(0, 10) + '...' : 'MISSING'}`,
+      );
 
       try {
         const response = await axios.post(url, compressed, {
@@ -290,8 +390,10 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
           timeout: 60000,
           validateStatus: (s) => s >= 200 && s < 300,
         });
-        
-        this.logger.log(`✅ Upload successful for ${period}. Status: ${response.status}`);
+
+        this.logger.log(
+          `✅ Upload successful for ${period}. Status: ${response.status}`,
+        );
         this.logger.log(`📥 Response: ${JSON.stringify(response.data)}`);
 
         // Update hash
@@ -305,15 +407,19 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
         // Persist hash and lastSuccessAt to database
         try {
           const hashConfigKey = `period_upload_hash_${period}`;
-          await this.generalConfigs.setTypedValue(hashConfigKey, hash, 'string');
-          await this.generalConfigs.setTypedValue(
+          await this.configStore.setString(hashConfigKey, hash);
+          await this.configStore.setString(
             this.CONFIG_KEY_LAST_SUCCESS,
             successTimestamp,
-            'string',
           );
-          this.logger.log(`✅ Period uploader: Persisted hash for ${period} period and lastSuccessAt (${successTimestamp}) to database (key: ${this.CONFIG_KEY_LAST_SUCCESS})`);
+          this.logger.log(
+            `✅ Period uploader: Persisted hash for ${period} period and lastSuccessAt (${successTimestamp}) to database (key: ${this.CONFIG_KEY_LAST_SUCCESS})`,
+          );
         } catch (error) {
-          this.logger.error(`❌ Period uploader: Failed to persist data for ${period} period:`, error);
+          this.logger.error(
+            `❌ Period uploader: Failed to persist data for ${period} period:`,
+            error,
+          );
           // Don't throw - we still want to return success even if persistence fails
         }
 
@@ -325,10 +431,14 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
         };
       } catch (err: any) {
         const httpStatus =
-          typeof err?.response?.status === 'number' ? err.response.status : null;
+          typeof err?.response?.status === 'number'
+            ? err.response.status
+            : null;
         const axiosCode = err?.code || null;
         const msg = err?.message || String(err);
-        const responseData = err?.response?.data ? JSON.stringify(err.response.data) : 'No response data';
+        const responseData = err?.response?.data
+          ? JSON.stringify(err.response.data)
+          : 'No response data';
 
         this.logger.error(`❌ Upload failed for ${period} period:`);
         this.logger.error(`   Status: ${httpStatus || axiosCode || 'unknown'}`);
@@ -336,7 +446,9 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
         this.logger.error(`   Response: ${responseData}`);
         this.logger.error(`   URL: ${url}`);
         if (err?.response) {
-          this.logger.error(`   Response headers: ${JSON.stringify(err.response.headers)}`);
+          this.logger.error(
+            `   Response headers: ${JSON.stringify(err.response.headers)}`,
+          );
         }
 
         return {
@@ -350,7 +462,9 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
     } catch (err: any) {
       this.running = false;
       const msg = err?.message || String(err);
-      this.logger.error(`❌ Fatal error in uploadPeriodData for ${period}: ${msg}`);
+      this.logger.error(
+        `❌ Fatal error in uploadPeriodData for ${period}: ${msg}`,
+      );
       return {
         outcome: 'error',
         message: `Fatal error: ${msg}`,
@@ -366,7 +480,9 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
 
       // Inventory tab data
       inventory_cards: a.inventoryCards.map(this.mapKeyMetric),
-      distribution_by_category: a.distributionByCategory.map(this.mapCategorySlice),
+      distribution_by_category: a.distributionByCategory.map(
+        this.mapCategorySlice,
+      ),
       monthly_stocked_vs_sold: a.monthlyStockedVsSold.map(this.mapMonthlyPoint),
       out_of_stock_products: a.outOfStockProducts.map(this.mapProduct),
       expired_products: a.expiredProducts.map(this.mapProduct),
@@ -433,6 +549,8 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
       unit_price: p.unitPrice,
       last_restock: p.lastRestock ?? null,
       supplier: p.supplier ?? null,
+      // Units sold in the list's period (fast/slow movers, most ordered)
+      sold_qty: p.orderedQty ?? null,
     };
   }
 
@@ -441,7 +559,11 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
     return crypto.createHash('sha256').update(text).digest('hex');
   }
 
-  getStatus(): { running: boolean; lastHashes: Record<string, string>; lastSuccessAt: string | null } {
+  getStatus(): {
+    running: boolean;
+    lastHashes: Record<string, string>;
+    lastSuccessAt: string | null;
+  } {
     return {
       running: this.running,
       lastHashes: Object.fromEntries(this.previousHashes),
@@ -449,4 +571,3 @@ export class AnalyticsPeriodUploaderService implements OnModuleInit {
     };
   }
 }
-

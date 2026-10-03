@@ -23,7 +23,13 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { UserRole } from '@prisma/client';
-import { ApproveSaleDto, DeclineSaleDto, SalesQueryDto, CreateSaleDto, ProductSalesQueryDto } from './dto';
+import {
+  ApproveSaleDto,
+  DeclineSaleDto,
+  SalesQueryDto,
+  CreateSaleDto,
+  ProductSalesQueryDto,
+} from './dto';
 import { IdempotencyInterceptor } from '../common/idempotency.interceptor';
 
 @ApiTags('Sales')
@@ -95,6 +101,22 @@ export class SalesController {
         error.status || HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }
+  }
+
+  @Post('expiry-check')
+  @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
+  @ApiOperation({
+    summary:
+      'Check sale items against batches of the same product that expire sooner',
+  })
+  @ApiBody({ type: CreateSaleDto })
+  @ApiResponse({
+    status: 201,
+    description:
+      'The configured policy (off, warn, block) and any conflicting items',
+  })
+  checkExpiryOrder(@Body() dto: CreateSaleDto) {
+    return this.salesService.checkExpiryOrder(dto.items);
   }
 
   @Post('group/:saleId/approve')
@@ -203,7 +225,9 @@ export class SalesController {
 
   @Get('products')
   @Roles(UserRole.SELLER, UserRole.ADMIN, UserRole.MANAGER, UserRole.PHARMACIST)
-  @ApiOperation({ summary: 'Get product sales with pagination and period filtering' })
+  @ApiOperation({
+    summary: 'Get product sales with pagination and period filtering',
+  })
   @ApiResponse({
     status: 200,
     description: 'Product sales retrieved successfully',

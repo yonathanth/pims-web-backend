@@ -3,38 +3,72 @@ import * as bcrypt from 'bcryptjs';
 
 const prisma = new PrismaClient();
 
-async function main() {
-  const existingAdmin = await prisma.user.findFirst({
-    where: { role: UserRole.ADMIN },
+async function seedUser(opts: {
+  role: UserRole;
+  username: string;
+  email: string;
+  password: string;
+  fullName: string;
+  skipIfRoleExists?: boolean;
+}) {
+  const existing = await prisma.user.findFirst({
+    where: opts.skipIfRoleExists
+      ? { OR: [{ role: opts.role }, { username: opts.username }] }
+      : { username: opts.username },
   });
-  if (existingAdmin) {
-    console.log('Admin user already exists. Skipping seed.');
+  if (existing) {
+    console.log(
+      `${opts.role} user already exists (username: ${existing.username}). Skipping.`,
+    );
     return;
   }
 
-  const username = process.env.SEED_ADMIN_USERNAME || 'admin';
-  const email = process.env.SEED_ADMIN_EMAIL || 'admin@example.com';
-  const password = process.env.SEED_ADMIN_PASSWORD || 'admin123';
+  const passwordHash = await bcrypt.hash(opts.password, 10);
 
-  const passwordHash = await bcrypt.hash(password, 10);
-
-  const admin = await prisma.user.create({
+  const user = await prisma.user.create({
     data: {
-      username,
-      email,
-      fullName: 'System Administrator',
+      username: opts.username,
+      email: opts.email,
+      fullName: opts.fullName,
       passwordHash,
-      role: UserRole.ADMIN,
+      role: opts.role,
     },
   });
 
-  console.log('Seeded admin user:');
+  console.log(`Seeded ${user.role} user:`);
   console.log({
-    username: admin.username,
-    email: admin.email,
-    role: admin.role,
+    username: user.username,
+    email: user.email,
+    role: user.role,
   });
-  console.log('Login with these credentials, then change the password.');
+}
+
+async function main() {
+  await seedUser({
+    role: UserRole.ADMIN,
+    username: process.env.SEED_ADMIN_USERNAME || 'admin',
+    email: process.env.SEED_ADMIN_EMAIL || 'admin@example.com',
+    password: process.env.SEED_ADMIN_PASSWORD || 'admin123',
+    fullName: 'System Administrator',
+  });
+
+  await seedUser({
+    role: UserRole.MANAGER,
+    username: process.env.SEED_MANAGER_USERNAME || 'manager',
+    email: process.env.SEED_MANAGER_EMAIL || 'manager@example.com',
+    password: process.env.SEED_MANAGER_PASSWORD || 'manager123',
+    fullName: 'Pharmacy Manager',
+  });
+
+  await seedUser({
+    role: UserRole.SELLER,
+    username: process.env.SEED_SELLER_USERNAME || 'seller',
+    email: process.env.SEED_SELLER_EMAIL || 'seller@example.com',
+    password: process.env.SEED_SELLER_PASSWORD || 'seller123',
+    fullName: 'Pharmacy Seller',
+  });
+
+  console.log('Login with these credentials, then change the passwords.');
 }
 
 main()

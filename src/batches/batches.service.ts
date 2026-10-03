@@ -5,7 +5,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { Batch, Prisma, UserRole } from '@prisma/client';
+import { Batch, Prisma } from '@prisma/client';
 import {
   CreateBatchDto,
   UpdateBatchDto,
@@ -25,7 +25,10 @@ export class BatchesService {
   ) {}
 
   // Helper function to format drug name as "genericName (tradeName)" or just "genericName"
-  private formatDrugName(genericName: string, tradeName?: string | null): string {
+  private formatDrugName(
+    genericName: string,
+    tradeName?: string | null,
+  ): string {
     if (tradeName && tradeName.trim()) {
       return `${genericName} (${tradeName})`;
     }
@@ -147,7 +150,10 @@ export class BatchesService {
 
         return result;
       } catch (error: any) {
-        if (error.code === 'P2002' && error.meta?.target?.includes('batchNumber')) {
+        if (
+          error.code === 'P2002' &&
+          error.meta?.target?.includes('batchNumber')
+        ) {
           throw new ConflictException(
             normalizedBatchNumber
               ? `Batch number "${normalizedBatchNumber}" already exists`
@@ -178,7 +184,10 @@ export class BatchesService {
           data: batchData,
         });
       } catch (error: any) {
-        if (error.code === 'P2002' && error.meta?.target?.includes('batchNumber')) {
+        if (
+          error.code === 'P2002' &&
+          error.meta?.target?.includes('batchNumber')
+        ) {
           throw new ConflictException(
             normalizedBatchNumber
               ? `Batch number "${normalizedBatchNumber}" already exists`
@@ -190,11 +199,14 @@ export class BatchesService {
     }
   }
 
-  async findAll(
-    query?: ListBatchesDto,
-  ): Promise<
+  async findAll(query?: ListBatchesDto): Promise<
     PaginatedResult<
-      Batch & { drugSku: string; drugName: string; supplierName: string; unitTypeName?: string }
+      Batch & {
+        drugSku: string;
+        drugName: string;
+        supplierName: string;
+        unitTypeName?: string;
+      }
     >
   > {
     const page = query?.page ?? 1;
@@ -204,15 +216,15 @@ export class BatchesService {
     const sortDir = query?.sortDir ?? 'asc';
     const stockStatus = query?.stockStatus ?? 'All';
 
-    const where: Prisma.BatchWhereInput = {};
-    if (query?.supplierId) where.supplierId = query.supplierId;
-    if (query?.drugId) where.drugId = query.drugId;
+    // Conditions are collected in AND so filters combine instead of overwriting each other
+    const and: Prisma.BatchWhereInput[] = [];
+    if (query?.supplierId) and.push({ supplierId: query.supplierId });
+    if (query?.drugId) and.push({ drugId: query.drugId });
     if (query?.expiryFrom || query?.expiryTo) {
-      where.expiryDate = {};
-      if (query.expiryFrom)
-        (where.expiryDate as any).gte = new Date(query.expiryFrom);
-      if (query.expiryTo)
-        (where.expiryDate as any).lte = new Date(query.expiryTo);
+      const expiryDate: Prisma.DateTimeFilter = {};
+      if (query.expiryFrom) expiryDate.gte = new Date(query.expiryFrom);
+      if (query.expiryTo) expiryDate.lte = new Date(query.expiryTo);
+      and.push({ expiryDate });
     }
 
     // Add stock status filtering
@@ -223,72 +235,91 @@ export class BatchesService {
 
       switch (stockStatus) {
         case 'In stock':
-          where.currentQty = { gt: 0 };
-          where.expiryDate = { gt: now };
+          // Includes expired batches that still have quantity
+          and.push({ currentQty: { gt: 0 } });
           break;
         case 'Out of Stock':
-          where.currentQty = { lte: 0 };
+          and.push({ currentQty: { lte: 0 } });
+          break;
+        case 'Sellable':
+          // What a sale can use: has stock and hasn't expired
+          and.push({ currentQty: { gt: 0 } });
+          and.push({ expiryDate: { gte: now } });
           break;
         case 'Low Stock':
-          // Use batch-specific low stock threshold with fallback of 10
-          where.currentQty = { gt: 0, lte: 10 }; // This will be refined in the query
+          // Use batch-specific low stock threshold, falling back to 10 when unset (0)
+          and.push({ currentQty: { gt: 0 } });
+          and.push({
+            OR: [
+              {
+                lowStockThreshold: { gt: 0 },
+                currentQty: {
+                  lte: this.prisma.batch.fields.lowStockThreshold,
+                },
+              },
+              { lowStockThreshold: { lte: 0 }, currentQty: { lte: 10 } },
+            ],
+          });
           break;
         case 'Expired':
-          where.expiryDate = { lt: now };
-          where.currentQty = { gt: 0 };
+          and.push({ expiryDate: { lt: now } });
+          and.push({ currentQty: { gt: 0 } });
           break;
         case 'Near-Expiry':
-          where.expiryDate = {
-            gte: now,
-            lte: thirtyDaysFromNow,
-          };
-          where.currentQty = { gt: 0 };
+          and.push({ expiryDate: { gte: now, lte: thirtyDaysFromNow } });
+          and.push({ currentQty: { gt: 0 } });
           break;
       }
     }
 
     // Search via relations (drug.sku/name, supplier.name, category.name, location.name) or batchNumber
     if (query?.search) {
-      where.OR = [
-        {
-          drug: { sku: { contains: query.search, mode: 'insensitive' } } as any,
-        },
-        {
-          drug: {
-            genericName: { contains: query.search, mode: 'insensitive' },
-          } as any,
-        },
-        {
-          drug: {
-            tradeName: { contains: query.search, mode: 'insensitive' },
-          } as any,
-        },
-        {
-          drug: {
-            category: {
-              name: { contains: query.search, mode: 'insensitive' },
-            },
-          } as any,
-        },
-        {
-          supplier: {
-            name: { contains: query.search, mode: 'insensitive' },
-          } as any,
-        },
-        {
-          batchNumber: { contains: query.search, mode: 'insensitive' },
-        },
-        {
-          locationBatches: {
-            some: {
-              location: {
+      and.push({
+        OR: [
+          {
+            drug: {
+              sku: { contains: query.search, mode: 'insensitive' },
+            } as any,
+          },
+          {
+            drug: {
+              genericName: { contains: query.search, mode: 'insensitive' },
+            } as any,
+          },
+          {
+            drug: {
+              tradeName: { contains: query.search, mode: 'insensitive' },
+            } as any,
+          },
+          {
+            drug: {
+              category: {
                 name: { contains: query.search, mode: 'insensitive' },
+              },
+            } as any,
+          },
+          {
+            supplier: {
+              name: { contains: query.search, mode: 'insensitive' },
+            } as any,
+          },
+          {
+            batchNumber: { contains: query.search, mode: 'insensitive' },
+          },
+          {
+            locationBatches: {
+              some: {
+                location: {
+                  name: { contains: query.search, mode: 'insensitive' },
+                },
               },
             },
           },
-        },
-      ];
+        ],
+      });
     }
+
+    const where: Prisma.BatchWhereInput = and.length ? { AND: and } : {};
 
     // Build orderBy clause
     let orderBy: any;
@@ -336,8 +367,7 @@ export class BatchesService {
       }),
     ]);
 
-    // Transform data and apply low stock filtering if needed
-    let data = rawData.map((batch) => ({
+    const data = rawData.map((batch) => ({
       ...batch,
       drugSku: batch.drug.sku,
       drugName: this.formatDrugName(
@@ -356,14 +386,6 @@ export class BatchesService {
       supplierName: string;
       unitTypeName?: string;
     })[];
-
-    // Apply low stock filtering with batch-specific thresholds
-    if (stockStatus === 'Low Stock') {
-      data = data.filter((batch) => {
-        const threshold = batch.lowStockThreshold || 10; // fallback to 10
-        return batch.currentQty > 0 && batch.currentQty <= threshold;
-      });
-    }
 
     return {
       data,
@@ -418,7 +440,12 @@ export class BatchesService {
       drug: undefined, // Remove the drug object
       supplier: undefined, // Remove the supplier object
       unitType: undefined, // Remove the unitType object (will be included in response)
-    } as Batch & { drugSku: string; drugName: string; supplierName: string; unitTypeName?: string };
+    } as Batch & {
+      drugSku: string;
+      drugName: string;
+      supplierName: string;
+      unitTypeName?: string;
+    };
   }
 
   @Audit({
@@ -497,9 +524,9 @@ export class BatchesService {
 
       // Handle location updates if provided
       if (locationIds !== undefined) {
+        const uniqueLocationIds = Array.from(new Set(locationIds));
         // Validate all provided locations exist
-        if (locationIds.length > 0) {
-          const uniqueLocationIds = Array.from(new Set(locationIds));
+        if (uniqueLocationIds.length > 0) {
           const locations = await this.prisma.location.findMany({
             where: { id: { in: uniqueLocationIds } },
             select: { id: true },
@@ -532,22 +559,33 @@ export class BatchesService {
             },
           });
 
-          // Remove existing location mappings
-          await tx.locationBatch.deleteMany({
+          // Only rebuild mappings when the set of locations actually changed,
+          // so unrelated edits keep the per-location quantities intact
+          const existing = await tx.locationBatch.findMany({
             where: { batchId: id },
+            select: { locationId: true },
           });
+          const existingIds = new Set(existing.map((e) => e.locationId));
+          const unchanged =
+            existingIds.size === uniqueLocationIds.length &&
+            uniqueLocationIds.every((locId) => existingIds.has(locId));
 
-          // Create new location mappings if any
-          if (locationIds.length > 0) {
-            await tx.locationBatch.createMany({
-              data: locationIds.map((locationId) => ({
-                locationId,
-                batchId: id,
-                quantity: Math.floor(
-                  (updated.currentQty || 0) / locationIds.length,
-                ),
-              })),
+          if (!unchanged) {
+            await tx.locationBatch.deleteMany({
+              where: { batchId: id },
             });
+
+            if (uniqueLocationIds.length > 0) {
+              await tx.locationBatch.createMany({
+                data: uniqueLocationIds.map((locationId) => ({
+                  locationId,
+                  batchId: id,
+                  quantity: Math.floor(
+                    (updated.currentQty || 0) / uniqueLocationIds.length,
+                  ),
+                })),
+              });
+            }
           }
 
           return updated;
@@ -573,7 +611,10 @@ export class BatchesService {
     } catch (error: any) {
       if (error.code === 'P2025')
         throw new NotFoundException(`Batch with ID ${id} not found`);
-      if (error.code === 'P2002' && error.meta?.target?.includes('batchNumber')) {
+      if (
+        error.code === 'P2002' &&
+        error.meta?.target?.includes('batchNumber')
+      ) {
         const batchNumber = data?.batchNumber;
         throw new ConflictException(
           batchNumber
@@ -606,56 +647,25 @@ export class BatchesService {
         throw new NotFoundException(`Batch with ID ${id} not found`);
       }
 
-      // Get current user to check if admin
-      const currentUser = this.requestContext.getCurrentUser();
-      const isAdmin = currentUser?.role === UserRole.ADMIN;
-
-      // If not admin, enforce restrictions
-      if (!isAdmin) {
-        if (batchWithRelations.transactions.length > 0) {
-          throw new ConflictException(
-            'Cannot delete batch with associated transactions',
-          );
-        }
-
-        if (batchWithRelations.purchaseOrderItems.length > 0) {
-          throw new ConflictException(
-            'Cannot delete batch with associated purchase order items',
-          );
-        }
-
-        if (batchWithRelations.locationBatches.length > 0) {
-          throw new ConflictException(
-            'Cannot delete batch while it has inventory assigned to locations. Move or clear inventory first.',
-          );
-        }
-      } else {
-        // Admin can force delete - remove related records first
-        // Delete location batches
-        if (batchWithRelations.locationBatches.length > 0) {
-          await this.prisma.locationBatch.deleteMany({
-            where: { batchId: id },
-          });
-        }
-
-        // Delete transactions
-        if (batchWithRelations.transactions.length > 0) {
-          await this.prisma.transaction.deleteMany({
-            where: { batchId: id },
-          });
-        }
-
-        // Delete purchase order items
-        if (batchWithRelations.purchaseOrderItems.length > 0) {
-          await this.prisma.purchaseOrderItem.deleteMany({
-            where: { batchId: id },
-          });
-        }
+      // Deletion is only for correcting mistaken entries. Batches with history
+      // (transactions or purchase orders) can't be deleted by anyone, including
+      // admins - write off the remaining stock with an adjustment instead.
+      if (batchWithRelations.transactions.length > 0) {
+        throw new ConflictException(
+          'Cannot delete a batch that has transactions. Use a stock adjustment to write off its quantity instead.',
+        );
       }
 
-      // Now safe to delete the batch
-      return await this.prisma.batch.delete({
-        where: { id },
+      if (batchWithRelations.purchaseOrderItems.length > 0) {
+        throw new ConflictException(
+          'Cannot delete a batch that is linked to a purchase order.',
+        );
+      }
+
+      // Location assignments carry no history, so they are removed with the batch
+      return await this.prisma.$transaction(async (tx) => {
+        await tx.locationBatch.deleteMany({ where: { batchId: id } });
+        return tx.batch.delete({ where: { id } });
       });
     } catch (error) {
       if (error.code === 'P2025') {

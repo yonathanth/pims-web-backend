@@ -1,9 +1,8 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
 import axios from 'axios';
 import { AnalyticsService } from './analytics.service';
 import { AnalyticsPeriodUploaderService } from './analytics-period-uploader.service';
-import { GeneralConfigsService } from '../general-configs/general-configs.service';
+import { ConfigStoreService } from '../general-configs/config-store.service';
 import {
   AnalyticsResponse,
   KeyMetric,
@@ -46,24 +45,28 @@ export class AnalyticsUploaderService implements OnModuleInit {
   constructor(
     private readonly analyticsService: AnalyticsService,
     private readonly periodUploader: AnalyticsPeriodUploaderService,
-    private readonly generalConfigs: GeneralConfigsService,
+    private readonly configStore: ConfigStoreService,
   ) {}
 
   async onModuleInit() {
     // Load persisted lastSuccessAt and hash from database
     try {
-      const lastSuccessConfig = await this.generalConfigs
-        .getTypedValue<string>(this.CONFIG_KEY_LAST_SUCCESS, 'string')
+      const lastSuccessConfig = await this.configStore
+        .getString(this.CONFIG_KEY_LAST_SUCCESS)
         .catch(() => null);
-      const lastHashConfig = await this.generalConfigs
-        .getTypedValue<string>(this.CONFIG_KEY_LAST_HASH, 'string')
+      const lastHashConfig = await this.configStore
+        .getString(this.CONFIG_KEY_LAST_HASH)
         .catch(() => null);
 
       if (lastSuccessConfig) {
         this.status.lastSuccessAt = lastSuccessConfig;
-        this.logger.log(`✅ Loaded persisted lastSuccessAt from database: ${lastSuccessConfig}`);
+        this.logger.log(
+          `✅ Loaded persisted lastSuccessAt from database: ${lastSuccessConfig}`,
+        );
       } else {
-        this.logger.debug('No persisted lastSuccessAt found in database for old uploader');
+        this.logger.debug(
+          'No persisted lastSuccessAt found in database for old uploader',
+        );
       }
       if (lastHashConfig) {
         this.previousHash = lastHashConfig;
@@ -75,20 +78,23 @@ export class AnalyticsUploaderService implements OnModuleInit {
     }
   }
 
-  @Cron(CronExpression.EVERY_HOUR)
+  // Not scheduled any more: AnalyticsPeriodUploaderService runs the uploads
+  // (daily every 10 minutes, other periods every 6 hours)
   async pushIfChanged() {
     // Delegate to period uploader for daily period (new format)
-    this.logger.log('🔄 Old uploader cron triggered - delegating to period uploader for daily sync');
+    this.logger.log(
+      '🔄 Old uploader cron triggered - delegating to period uploader for daily sync',
+    );
     const attemptStart = Date.now();
     this.status.lastAttemptAt = new Date().toISOString();
     this.running = true;
-    
+
     try {
       const results = await this.periodUploader.syncAllPeriods(false);
       const dailyResult = results.find((r: any) => r.period === 'daily');
-      
+
       this.status.lastDurationMs = Date.now() - attemptStart;
-      
+
       if (dailyResult?.outcome === 'uploaded') {
         const successTimestamp = new Date().toISOString();
         this.status.lastSuccessAt = successTimestamp;
@@ -97,21 +103,24 @@ export class AnalyticsUploaderService implements OnModuleInit {
         this.status.lastError = null;
         // Persist lastSuccessAt to database
         try {
-          await this.generalConfigs.setTypedValue(
+          await this.configStore.setString(
             this.CONFIG_KEY_LAST_SUCCESS,
             successTimestamp,
-            'string',
           );
           if (dailyResult.hash) {
-            await this.generalConfigs.setTypedValue(
+            await this.configStore.setString(
               this.CONFIG_KEY_LAST_HASH,
               dailyResult.hash,
-              'string',
             );
           }
-          this.logger.debug('Persisted upload status to database after period sync');
+          this.logger.debug(
+            'Persisted upload status to database after period sync',
+          );
         } catch (error) {
-          this.logger.warn('Failed to persist upload status after period sync:', error);
+          this.logger.warn(
+            'Failed to persist upload status after period sync:',
+            error,
+          );
         }
         this.logger.log('✅ Period sync completed via old uploader cron');
       } else if (dailyResult?.outcome === 'skipped-no-change') {
@@ -120,24 +129,29 @@ export class AnalyticsUploaderService implements OnModuleInit {
         // Persist hash even on skip
         if (dailyResult.hash) {
           try {
-            await this.generalConfigs.setTypedValue(
+            await this.configStore.setString(
               this.CONFIG_KEY_LAST_HASH,
               dailyResult.hash,
-              'string',
             );
           } catch (error) {
             this.logger.warn('Failed to persist hash after skip:', error);
           }
         }
-        this.logger.log('⏭️ Period sync skipped (no changes) via old uploader cron');
+        this.logger.log(
+          '⏭️ Period sync skipped (no changes) via old uploader cron',
+        );
       } else {
         this.status.lastError = dailyResult?.message || 'Period sync failed';
-        this.logger.error(`❌ Period sync failed via old uploader cron: ${this.status.lastError}`);
+        this.logger.error(
+          `❌ Period sync failed via old uploader cron: ${this.status.lastError}`,
+        );
       }
     } catch (error: any) {
       this.status.lastError = error.message || String(error);
       this.status.lastDurationMs = Date.now() - attemptStart;
-      this.logger.error(`❌ Period sync failed via old uploader cron: ${this.status.lastError}`);
+      this.logger.error(
+        `❌ Period sync failed via old uploader cron: ${this.status.lastError}`,
+      );
     } finally {
       this.running = false;
     }
@@ -145,19 +159,21 @@ export class AnalyticsUploaderService implements OnModuleInit {
 
   async triggerUpload(force = false): Promise<UploadAttemptResult> {
     // Delegate to period uploader for daily period (new format)
-    this.logger.log(`🔄 Manual upload triggered - delegating to period uploader (force=${force})`);
+    this.logger.log(
+      `🔄 Manual upload triggered - delegating to period uploader (force=${force})`,
+    );
     const attemptStart = Date.now();
     this.status.lastAttemptAt = new Date().toISOString();
     this.running = true;
     this.status.lastError = null;
     this.status.lastSkipReason = null;
-    
+
     try {
       const results = await this.periodUploader.syncAllPeriods(force);
       const dailyResult = results.find((r: any) => r.period === 'daily');
-      
+
       this.status.lastDurationMs = Date.now() - attemptStart;
-      
+
       if (dailyResult?.outcome === 'uploaded') {
         const successTimestamp = new Date().toISOString();
         this.status.lastSuccessAt = successTimestamp;
@@ -165,21 +181,24 @@ export class AnalyticsUploaderService implements OnModuleInit {
         this.status.lastResponseCode = 200;
         // Persist lastSuccessAt to database
         try {
-          await this.generalConfigs.setTypedValue(
+          await this.configStore.setString(
             this.CONFIG_KEY_LAST_SUCCESS,
             successTimestamp,
-            'string',
           );
           if (dailyResult.hash) {
-            await this.generalConfigs.setTypedValue(
+            await this.configStore.setString(
               this.CONFIG_KEY_LAST_HASH,
               dailyResult.hash,
-              'string',
             );
           }
-          this.logger.debug('Persisted upload status to database after manual trigger');
+          this.logger.debug(
+            'Persisted upload status to database after manual trigger',
+          );
         } catch (error) {
-          this.logger.warn('Failed to persist upload status after manual trigger:', error);
+          this.logger.warn(
+            'Failed to persist upload status after manual trigger:',
+            error,
+          );
         }
         return {
           outcome: dailyResult.outcome as UploadOutcome,
@@ -191,10 +210,9 @@ export class AnalyticsUploaderService implements OnModuleInit {
         // Persist hash even on skip
         if (dailyResult.hash) {
           try {
-            await this.generalConfigs.setTypedValue(
+            await this.configStore.setString(
               this.CONFIG_KEY_LAST_HASH,
               dailyResult.hash,
-              'string',
             );
           } catch (error) {
             this.logger.warn('Failed to persist hash after skip:', error);
@@ -207,7 +225,7 @@ export class AnalyticsUploaderService implements OnModuleInit {
       } else {
         this.status.lastError = dailyResult?.message || 'Period sync failed';
         return {
-          outcome: dailyResult?.outcome as UploadOutcome || 'error',
+          outcome: (dailyResult?.outcome as UploadOutcome) || 'error',
           message: dailyResult?.message || 'Period sync failed',
         };
       }
@@ -227,19 +245,24 @@ export class AnalyticsUploaderService implements OnModuleInit {
   getStatus(): AnalyticsUploadStatusDto {
     // Get status from period uploader for daily period
     const periodStatus = this.periodUploader.getStatus();
-    
+
     // Merge period uploader status with old format for backward compatibility
     // Prefer period uploader's lastSuccessAt if available, otherwise use old uploader's
     // The period uploader is the source of truth since it's the one actually doing uploads now
-    const lastSuccessAt = periodStatus.lastSuccessAt || this.status.lastSuccessAt;
-    
+    const lastSuccessAt =
+      periodStatus.lastSuccessAt || this.status.lastSuccessAt;
+
     // Log detailed status for debugging
     if (!lastSuccessAt) {
-      this.logger.warn(`⚠️ getStatus() - No lastSuccessAt found. periodStatus.lastSuccessAt: ${periodStatus.lastSuccessAt}, this.status.lastSuccessAt: ${this.status.lastSuccessAt}. This means no successful upload has occurred yet.`);
+      this.logger.warn(
+        `⚠️ getStatus() - No lastSuccessAt found. periodStatus.lastSuccessAt: ${periodStatus.lastSuccessAt}, this.status.lastSuccessAt: ${this.status.lastSuccessAt}. This means no successful upload has occurred yet.`,
+      );
     } else {
-      this.logger.debug(`✅ getStatus() - lastSuccessAt: ${lastSuccessAt} (from ${periodStatus.lastSuccessAt ? 'period uploader' : 'old uploader'})`);
+      this.logger.debug(
+        `✅ getStatus() - lastSuccessAt: ${lastSuccessAt} (from ${periodStatus.lastSuccessAt ? 'period uploader' : 'old uploader'})`,
+      );
     }
-    
+
     return {
       running: periodStatus.running || this.running,
       lastAttemptAt: this.status.lastAttemptAt,
@@ -293,9 +316,11 @@ export class AnalyticsUploaderService implements OnModuleInit {
       // Get today's date in ISO format (YYYY-MM-DD) for daily snapshot
       const today = new Date();
       const todayISO = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-      
-      this.logger.debug(`Fetching daily analytics snapshot for date: ${todayISO}`);
-      
+
+      this.logger.debug(
+        `Fetching daily analytics snapshot for date: ${todayISO}`,
+      );
+
       // Get analytics snapshot for exact current date (not last 24 hours)
       let analytics: AnalyticsResponse;
       try {
@@ -304,19 +329,25 @@ export class AnalyticsUploaderService implements OnModuleInit {
           dateIso: todayISO,
         });
       } catch (error: any) {
-        this.logger.error(`Failed to fetch analytics data: ${error?.message || String(error)}`);
-        throw new Error(`Analytics data fetch failed: ${error?.message || String(error)}`);
+        this.logger.error(
+          `Failed to fetch analytics data: ${error?.message || String(error)}`,
+        );
+        throw new Error(
+          `Analytics data fetch failed: ${error?.message || String(error)}`,
+        );
       }
-      
+
       // Validate analytics response has required data
       if (!analytics) {
         throw new Error('Analytics service returned null or undefined');
       }
-      
+
       const payload = this.mapToRemotePayload(analytics);
-      
+
       // Log payload summary for debugging
-      this.logger.debug(`Payload summary: ${payload.metrics?.length || 0} metrics, ${payload.inventory_cards?.length || 0} inventory cards, ${payload.distribution_by_category?.length || 0} categories, ${payload.fast_moving_products?.length || 0} fast moving, ${payload.slow_moving_products?.length || 0} slow moving`);
+      this.logger.debug(
+        `Payload summary: ${payload.metrics?.length || 0} metrics, ${payload.inventory_cards?.length || 0} inventory cards, ${payload.distribution_by_category?.length || 0} categories, ${payload.fast_moving_products?.length || 0} fast moving, ${payload.slow_moving_products?.length || 0} slow moving`,
+      );
 
       // Compute content hash over the analytics payload only
       const json = JSON.stringify(payload);
@@ -342,7 +373,7 @@ export class AnalyticsUploaderService implements OnModuleInit {
         hash,
         uploadedAt,
       };
-      
+
       this.logger.debug(`Upload timestamp: ${uploadedAt}`);
 
       this.logger.debug(`Attempting upload to: ${url}`);
@@ -364,25 +395,20 @@ export class AnalyticsUploaderService implements OnModuleInit {
       this.status.lastHash = hash;
       this.status.lastResponseCode = response.status;
       this.status.lastDurationMs = Date.now() - attemptStart;
-      
+
       // Persist lastSuccessAt and hash to database
       try {
-        await this.generalConfigs.setTypedValue(
+        await this.configStore.setString(
           this.CONFIG_KEY_LAST_SUCCESS,
           successTimestamp,
-          'string',
         );
-        await this.generalConfigs.setTypedValue(
-          this.CONFIG_KEY_LAST_HASH,
-          hash,
-          'string',
-        );
+        await this.configStore.setString(this.CONFIG_KEY_LAST_HASH, hash);
         this.logger.debug('Persisted upload status to database');
       } catch (error) {
         this.logger.warn('Failed to persist upload status:', error);
         // Don't fail the upload if persistence fails
       }
-      
+
       this.logger.log('Analytics snapshot uploaded');
       return {
         outcome: 'uploaded',
@@ -391,13 +417,11 @@ export class AnalyticsUploaderService implements OnModuleInit {
     } catch (err: any) {
       // Offline or server error; log and retry next tick
       const httpStatus =
-        typeof err?.response?.status === 'number'
-          ? err.response.status
-          : null;
+        typeof err?.response?.status === 'number' ? err.response.status : null;
       const axiosCode = err?.code || null;
       const msg = err?.message || String(err);
       const label = httpStatus ?? axiosCode ?? 'no-code';
-      
+
       // Enhanced error logging
       const errorDetails: any = {
         label,
@@ -411,23 +435,25 @@ export class AnalyticsUploaderService implements OnModuleInit {
       if (axiosCode) {
         errorDetails.axiosCode = axiosCode;
       }
-      
+
       this.logger.warn(`Upload failed (${label}): ${msg}`, errorDetails);
-      
+
       // Build user-friendly error message
       let userMessage = msg;
       if (axiosCode === 'ECONNREFUSED' || axiosCode === 'ENOTFOUND') {
         userMessage = `Cannot connect to remote server. Check network and URL: ${baseUrl}`;
       } else if (axiosCode === 'ETIMEDOUT') {
-        userMessage = 'Upload timed out after 60 seconds. Server may be slow or unreachable.';
+        userMessage =
+          'Upload timed out after 60 seconds. Server may be slow or unreachable.';
       } else if (httpStatus === 401 || httpStatus === 403) {
         userMessage = `Authentication failed (${httpStatus}). Check API key.`;
       } else if (httpStatus === 404) {
         // Check if response is HTML (likely Next.js frontend, not API)
-        const isHtmlResponse = err?.response?.data && 
-          typeof err.response.data === 'string' && 
+        const isHtmlResponse =
+          err?.response?.data &&
+          typeof err.response.data === 'string' &&
           err.response.data.includes('<!DOCTYPE html>');
-        
+
         if (isHtmlResponse) {
           userMessage = `API endpoint not found (404). The domain appears to be serving a frontend, not the API. Check if:
 1. Cloud API is running and accessible
@@ -440,7 +466,7 @@ Current URL: ${url}`;
       } else if (httpStatus) {
         userMessage = `Server error (${httpStatus}): ${msg}`;
       }
-      
+
       this.status.lastError = userMessage;
       this.status.lastResponseCode = httpStatus;
       if (!httpStatus && axiosCode) {
@@ -470,7 +496,7 @@ Current URL: ${url}`;
     return {
       // General cards (summary cards above tabs)
       metrics: a.metrics.map(this.mapKeyMetric),
-      
+
       // Inventory tab data
       inventory_cards: a.inventoryCards.map(this.mapKeyMetric),
       distribution_by_category: a.distributionByCategory.map(
@@ -483,7 +509,7 @@ Current URL: ${url}`;
         this.mapProduct,
       ),
       soon_to_expire_products: a.soonToExpireProducts.map(this.mapProduct),
-      
+
       // Sales tab data
       sales_cards: a.salesCards.map(this.mapKeyMetric),
       yearly_sales: a.yearlySales.map((y) => ({
@@ -492,10 +518,10 @@ Current URL: ${url}`;
       })),
       fast_moving_products: a.fastMovingProducts.map(this.mapProduct),
       slow_moving_products: a.slowMovingProducts.map(this.mapProduct),
-      
+
       // Supply tab data
       supply_cards: a.supplyCards.map(this.mapKeyMetric),
-      
+
       // Note: Removed top_suppliers, top_performers, most_ordered_products
       // as they belong to Supply and Employee tabs, not Sales/Inventory
     };

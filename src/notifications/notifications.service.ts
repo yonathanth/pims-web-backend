@@ -2,10 +2,8 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
-  OnModuleInit,
   Scope,
 } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { Notification, Prisma } from '@prisma/client';
 import {
@@ -20,8 +18,10 @@ import { AuditLogService } from '../audit-log/audit-log.service';
 import { Audit } from '../audit-log/audit.decorator';
 import { RequestContextService } from '../common/request-context.service';
 
+// Expiry scans live in ExpiryScannerService: lifecycle hooks and @Cron jobs
+// never run on request-scoped providers like this one
 @Injectable({ scope: Scope.REQUEST })
-export class NotificationsService implements OnModuleInit {
+export class NotificationsService {
   constructor(
     private prisma: PrismaService,
     private auditLogService: AuditLogService,
@@ -30,38 +30,6 @@ export class NotificationsService implements OnModuleInit {
 
   getCurrentUserId(): number | null {
     return this.requestContext.getCurrentUserId();
-  }
-
-  async onModuleInit() {
-    // Backfill any legacy rows where isRead is NULL
-    try {
-      await this.ensureNotificationDefaults();
-    } catch (e) {
-      console.warn(
-        '[NotificationsService] ensureNotificationDefaults failed:',
-        e,
-      );
-    }
-
-    // Run expiry scan on startup
-    console.log('Running notification expiry scan on startup...');
-    await this.scanExpiry();
-  }
-
-  private async ensureNotificationDefaults(): Promise<void> {
-    // Some legacy rows may have isRead = NULL; force them to false
-    // and ensure readAt is null when isRead is false
-    try {
-      await this.prisma.$executeRawUnsafe(
-        'UPDATE "notifications" SET "isRead" = false WHERE "isRead" IS NULL',
-      );
-      await this.prisma.$executeRawUnsafe(
-        'UPDATE "notifications" SET "readAt" = NULL WHERE "isRead" = false',
-      );
-    } catch (error) {
-      // Ignore if table/columns differ in local envs; logging above captures it
-      throw error;
-    }
   }
 
   async create(
@@ -81,22 +49,22 @@ export class NotificationsService implements OnModuleInit {
     });
   }
 
+  // matchText identifies the entity inside existing messages, e.g. "Batch #B12 ("
   async createIfNotExists(
     data: CreateNotificationDto,
     userId?: number,
+    matchText?: string,
   ): Promise<Notification | null> {
     // Check if similar notification already exists and is unread
     const existing = await this.prisma.notification.findFirst({
       where: {
         notificationType: data.notificationType,
         isRead: false,
-        ...(data.entityName && data.entityId
-          ? {
-              message: {
-                contains: `#${data.entityId}`,
-              },
-            }
-          : {}),
+        ...(matchText
+          ? { message: { contains: matchText } }
+          : data.entityName && data.entityId
+            ? { message: { contains: `#${data.entityId}` } }
+            : {}),
       },
     });
 
@@ -296,25 +264,36 @@ export class NotificationsService implements OnModuleInit {
 
     // Use batch-specific low stock threshold
     const lowStockThreshold = batch.lowStockThreshold;
+    // Messages name the batch by its number when it has one, so match on the
+    // same label (a bare "#id" never matched those and "#1" also matched "#12")
+    const batchRef = `Batch ${batch.batchNumber ? `#${batch.batchNumber}` : `#${batch.id}`} (`;
 
     if (batch.currentQty === 0) {
       // Out of stock
-      await this.createIfNotExists({
-        notificationType: NotificationType.OUT_OF_STOCK,
-        severity: NotificationSeverity.HIGH,
-        message: `Batch ${batch.batchNumber ? `#${batch.batchNumber}` : `#${batch.id}`} (${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) is out of stock`,
-        entityName: 'Batch',
-        entityId: batch.id,
-      });
+      await this.createIfNotExists(
+        {
+          notificationType: NotificationType.OUT_OF_STOCK,
+          severity: NotificationSeverity.HIGH,
+          message: `${batchRef}${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) is out of stock`,
+          entityName: 'Batch',
+          entityId: batch.id,
+        },
+        undefined,
+        batchRef,
+      );
     } else if (batch.currentQty <= lowStockThreshold) {
       // Low stock
-      await this.createIfNotExists({
-        notificationType: NotificationType.LOW_STOCK,
-        severity: NotificationSeverity.MEDIUM,
-        message: `Batch ${batch.batchNumber ? `#${batch.batchNumber}` : `#${batch.id}`} (${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) is running low on stock (${batch.currentQty} remaining)`,
-        entityName: 'Batch',
-        entityId: batch.id,
-      });
+      await this.createIfNotExists(
+        {
+          notificationType: NotificationType.LOW_STOCK,
+          severity: NotificationSeverity.MEDIUM,
+          message: `${batchRef}${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) is running low on stock (${batch.currentQty} remaining)`,
+          entityName: 'Batch',
+          entityId: batch.id,
+        },
+        undefined,
+        batchRef,
+      );
     }
 
     // If stock increased above threshold, mark low stock notifications as read
@@ -323,7 +302,7 @@ export class NotificationsService implements OnModuleInit {
         where: {
           notificationType: NotificationType.LOW_STOCK,
           isRead: false,
-          message: { contains: `#${batch.id}` },
+          message: { contains: batchRef },
         },
         data: { isRead: true, readAt: new Date() },
       });
@@ -335,114 +314,24 @@ export class NotificationsService implements OnModuleInit {
         where: {
           notificationType: NotificationType.OUT_OF_STOCK,
           isRead: false,
-          message: { contains: `#${batch.id}` },
+          message: { contains: batchRef },
         },
         data: { isRead: true, readAt: new Date() },
       });
     }
-  }
 
-  // Expiry evaluation methods
-  @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
-  async scanExpiry(): Promise<void> {
-    console.log('Running scheduled expiry scan at midnight...');
-    await this.performExpiryScan();
-  }
-
-  // Separate method for expiry scan that can be called on startup and scheduled
-  async performExpiryScan(): Promise<void> {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    console.log(
-      `Scanning for expiry notifications on: ${today.toISOString().split('T')[0]}`,
-    );
-
-    // Near expiry notifications (10, 5, 3, 2, 1 days)
-    const nearExpiryDays = [10, 5, 3, 2, 1];
-
-    for (const days of nearExpiryDays) {
-      const targetDate = new Date(today);
-      targetDate.setDate(today.getDate() + days);
-
-      const batches = await this.prisma.batch.findMany({
+    // Once a batch is sold out its expiry alerts no longer need attention
+    if (batch.currentQty === 0) {
+      await this.prisma.notification.updateMany({
         where: {
-          expiryDate: {
-            gte: new Date(targetDate.getTime()),
-            lt: new Date(targetDate.getTime() + 24 * 60 * 60 * 1000),
+          notificationType: {
+            in: [NotificationType.NEAR_EXPIRY, NotificationType.EXPIRED],
           },
-          // Removed currentQty filter - empty batches can still expire
+          isRead: false,
+          message: { contains: batchRef },
         },
-        include: { drug: true },
+        data: { isRead: true, readAt: new Date() },
       });
-
-      console.log(`Found ${batches.length} batches expiring in ${days} days`);
-
-      for (const batch of batches) {
-        const severity =
-          days <= 1
-            ? NotificationSeverity.HIGH
-            : days <= 3
-              ? NotificationSeverity.MEDIUM
-              : NotificationSeverity.LOW;
-
-        await this.createIfNotExists({
-          notificationType: NotificationType.NEAR_EXPIRY,
-          severity,
-          message: `Batch ${batch.batchNumber ? `#${batch.batchNumber}` : `#${batch.id}`} (${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) expires in ${days} day${days > 1 ? 's' : ''}`,
-          entityName: 'Batch',
-          entityId: batch.id,
-          expiresAt: batch.expiryDate.toISOString(),
-        });
-      }
     }
-
-    // Expired notifications (0, 1, 2, 3, 5, 10 days after expiry)
-    const expiredDays = [0, 1, 2, 3, 5, 10];
-
-    for (const days of expiredDays) {
-      const targetDate = new Date(today);
-      targetDate.setDate(today.getDate() - days);
-
-      const batches = await this.prisma.batch.findMany({
-        where: {
-          expiryDate: {
-            gte: new Date(targetDate.getTime()),
-            lt: new Date(targetDate.getTime() + 24 * 60 * 60 * 1000),
-          },
-          currentQty: { gt: 0 }, // Only notify about expired batches that still have stock
-        },
-        include: { drug: true },
-      });
-
-      console.log(
-        `Found ${batches.length} batches expired ${days === 0 ? 'today' : `${days} days ago`}`,
-      );
-
-      for (const batch of batches) {
-        const severity =
-          days === 0
-            ? NotificationSeverity.HIGH
-            : days <= 3
-              ? NotificationSeverity.MEDIUM
-              : NotificationSeverity.LOW;
-
-        const batchIdentifier = batch.batchNumber ? `#${batch.batchNumber}` : `#${batch.id}`;
-        const message =
-          days === 0
-            ? `Batch ${batchIdentifier} (${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) has expired today`
-            : `Batch ${batchIdentifier} (${batch.drug.tradeName ? `${batch.drug.genericName} (${batch.drug.tradeName})` : batch.drug.genericName}) expired ${days} day${days > 1 ? 's' : ''} ago`;
-
-        await this.createIfNotExists({
-          notificationType: NotificationType.EXPIRED,
-          severity,
-          message,
-          entityName: 'Batch',
-          entityId: batch.id,
-        });
-      }
-    }
-
-    console.log('Expiry scan completed.');
   }
 }
